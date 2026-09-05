@@ -28,6 +28,9 @@ spec:
     mkdir -p ~/rpmbuild/SPECS
     cp testing/{{ NAME }}.spec ~/rpmbuild/SPECS/
 
+install-dep:
+    sudo dnf builddep ~/rpmbuild/SPECS/{{ NAME }}.spec
+
 build:
     rpmbuild --undefine=_disable_source_fetch -bb ~/rpmbuild/SPECS/{{ NAME }}.spec
 
