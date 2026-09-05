@@ -3,28 +3,30 @@ set dotenv-load
 NAME := env('NAME')
 TAG := 'nightly'
 
+default:
+    echo "default command does nothing"
+
 all *FLAGS: clean (init FLAGS) sources spec build
 
 all-srpm *FLAGS: clean (init FLAGS) sources spec build-srpm
 
-# init will remove your repository XD, so let's add a safe guard
-default:
-    echo "default command does nothing"
-
 # Requires python3
 init *FLAGS:
-    python3 ../scripts/cosmic-packaging-bootstrap.py {{ NAME }} ../rpms/{{ NAME }} --cwd . --tag {{ TAG }} {{ FLAGS }} 
+    python3 scripts/cosmic-packaging-bootstrap.py {{ NAME }} --tag {{ TAG }} --input . --output testing {{ FLAGS }} 
 
 # Make sure rpm tree is setup (rpmdev-setuptree)
 
 # Install rpmdevtools
 sources:
-    cp vendor-* ~/rpmbuild/SOURCES/
-    cp *.patch ~/rpmbuild/SOURCES/ 2>/dev/null || true
-    spectool -g -R {{ NAME }}.spec
+    mkdir -p ~/rpmbuild/SOURCES
+    cp testing/vendor-* ~/rpmbuild/SOURCES/
+    cp testing/*.patch ~/rpmbuild/SOURCES/ 2>/dev/null || true
+    # download sources defined as URL in the specfile
+    spectool -g -R testing/{{ NAME }}.spec
 
 spec:
-    cp {{ NAME }}.spec ~/rpmbuild/SPECS/
+    mkdir -p ~/rpmbuild/SPECS
+    cp testing/{{ NAME }}.spec ~/rpmbuild/SPECS/
 
 build:
     rpmbuild --undefine=_disable_source_fetch -bb ~/rpmbuild/SPECS/{{ NAME }}.spec
@@ -36,9 +38,7 @@ fast-build:
     rpmbuild -bb --short-circuit ~/rpmbuild/SPECS/{{ NAME }}.spec
 
 clean:
-    rm -rf ./*
-    rm -rf ./.*
-    touch .keep
+    rm -rf testing
 
 clean-rpmbuild-dir:
     rm -rf ~/rpmbuild
@@ -49,7 +49,7 @@ clone-upstream:
     set -ex
     rm -rf upstream/{{ NAME }}
     git clone https://src.fedoraproject.org/rpms/{{ NAME }}.git upstream/{{ NAME }}
-    for p in $(ls patches/{{NAME}}/*.patch 2>/dev/null | sort); do
+    for p in $(ls patches/{{ NAME }}/*.patch 2>/dev/null | sort); do
         git -C upstream/{{ NAME }} am "../../$p"
     done
 
