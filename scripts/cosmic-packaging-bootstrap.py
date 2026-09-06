@@ -122,33 +122,18 @@ class ProjectInfo:
     def clone_fedora_git(
         self,
         base_dir: pathlib.Path,
+        input_dir: pathlib.Path,
     ) -> None:
         info(f"Cloning fedora git: {self.fedora_git}")
         if self.staging:
             info("Using staging layout")
             subprocess.run(
                 [
-                    "git",
-                    "clone",
-                    "--recurse-submodules",
-                    ProjectInfo.COSMIC_PACKAGING_GIT,
-                ],
-                cwd=base_dir,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "mv",
-                    base_dir.joinpath("cosmic-packaging")
-                    .joinpath("staging")
-                    .joinpath(self.rpm_name),
+                    "cp",
+                    "-r",
+                    input_dir.joinpath("staging").joinpath(self.rpm_name),
                     base_dir.joinpath(self.rpm_name),
                 ],
-                cwd=base_dir,
-                check=True,
-            )
-            subprocess.run(
-                ["rm", "-r", base_dir.joinpath("cosmic-packaging")],
                 cwd=base_dir,
                 check=True,
             )
@@ -214,7 +199,7 @@ class DirectoryInfo:
                 base_dir=self.upstream_project_directory.parent
             )
         if not fedora_dir:
-            project_info.clone_fedora_git(base_dir=self.fedora_project_directory.parent)
+            project_info.clone_fedora_git(base_dir=self.fedora_project_directory.parent, input_dir=self.input_dir)
 
         info(f"input_dir: {self.input_dir}")
         info(f"output_dir: {self.output_dir}")
@@ -764,6 +749,7 @@ PACKAGE_INFO: dict[str, ProjectInfo] = {
     "cosmic-monitor": ProjectInfo(rpm_name="cosmic-monitor", staging=True),
     "cosmic-notifications": ProjectInfo(rpm_name="cosmic-notifications"),
     "cosmic-osd": ProjectInfo(rpm_name="cosmic-osd"),
+    "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk", staging=True, latest_tag="1.7.0"),
     "cosmic-panel": ProjectInfo(rpm_name="cosmic-panel"),
     "cosmic-player": ProjectInfo(rpm_name="cosmic-player"),
     "cosmic-randr": ProjectInfo(rpm_name="cosmic-randr"),
