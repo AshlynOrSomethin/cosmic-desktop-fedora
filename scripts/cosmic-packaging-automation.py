@@ -61,6 +61,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 KOJI_HUB = "https://koji.fedoraproject.org/kojihub"
+FEDORA_SRC_REPO = "https://src.fedoraproject.org/rpms"
 
 FEDORA_TAGS: dict[str, str] = {
     "Rawhide": "fc46",
@@ -1149,6 +1150,21 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "403" in str(exc) and "rate limit" in str(exc).lower()
 
 
+def _fedora_repo_exists(rpm_name: str) -> bool:
+    """Check if the Fedora upstream repo for a package exists.
+
+    A missing repo (HTTP 404) means the package cannot be built via
+    fedpkg. Any other error is treated as "exists" so that transient
+    network issues do not silently drop packages.
+    """
+    url = f"{FEDORA_SRC_REPO}/{rpm_name}"
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=30)
+        return response.status_code != 404
+    except requests.RequestException:
+        return True
+
+
 def _rate_limit_wait_time(exc: Exception) -> float:
     """Seconds to wait before retrying after a rate limit error.
 
@@ -1454,6 +1470,20 @@ def main() -> None:
         scoped_packages = {args.rpm_name: PACKAGES[args.rpm_name]}
     else:
         scoped_packages = PACKAGES
+
+    # Drop packages that have no Fedora upstream repo: they cannot be
+    # built via fedpkg (e.g. cosmic-osk).
+    for pkg_name in list(scoped_packages):
+        if not _fedora_repo_exists(pkg_name):
+            print(
+                f"WARNING: {pkg_name} has no Fedora upstream repo "
+                f"({FEDORA_SRC_REPO}/{pkg_name}); it cannot be built and "
+                "will be skipped."
+            )
+            del scoped_packages[pkg_name]
+    if not scoped_packages:
+        print("ERROR: No buildable packages remain.", file=sys.stderr)
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Step 1 & 2: Setup (SSH agent + Kerberos)
