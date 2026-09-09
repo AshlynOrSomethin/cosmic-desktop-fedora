@@ -932,6 +932,12 @@ class PackageBuilder:
     def clone_fedpkg_repo(self) -> None:
         max_attempts = 5
         i = 0
+        # The automation runs non-interactively, so git must not prompt to
+        # confirm a new host key for pkgs.fedoraproject.org. accept-new
+        # auto-accepts unknown keys (storing them for later checks) while
+        # still rejecting a host whose key has changed.
+        env = dict(os.environ)
+        env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=accept-new"
         while not self.repo_dir.exists():
             if i >= max_attempts:
                 raise Exception(f"{self.package}: Could not clone repo")
@@ -940,6 +946,7 @@ class PackageBuilder:
                     ["fedpkg", "clone", self.package],
                     cwd=self.working_directory,
                     check=True,
+                    env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
