@@ -914,8 +914,14 @@ class PackageBuilder:
         url = f"https://api.github.com/repos/pop-os/{repo_name}/tags"
         with urlopen(url) as response:
             data = json.load(response)
-            res: str = data[0]["name"].strip()
-            return res.split("epoch-", 1)[1].replace("-", "~")
+        # Tags are not guaranteed to be epoch-tagged (e.g. the newest tag
+        # may be a plain version tag), so look for the first one that is
+        # rather than blindly indexing the response.
+        for tag in data:
+            name: str = tag["name"].strip()
+            if "epoch-" in name:
+                return name.split("epoch-", 1)[1].replace("-", "~")
+        return ""
 
     @staticmethod
     def download_package(rpm_name: str, output_path: Path) -> str:
