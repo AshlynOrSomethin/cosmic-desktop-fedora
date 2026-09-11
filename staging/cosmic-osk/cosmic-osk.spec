@@ -40,6 +40,7 @@ BuildRequires:  cargo
 BuildRequires:  just
 BuildRequires:  libxkbcommon-devel
 BuildRequires:  desktop-file-utils
+BuildRequires:  libudev-devel
 
 Requires:       cosmic-icon-theme >= %{cosmic_minver}
 

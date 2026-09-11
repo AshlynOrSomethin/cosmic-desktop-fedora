@@ -4,17 +4,16 @@ ExcludeArch: %{ix86}
 %bcond_without check
 
 %global crate cosmic-monitor
-%global build_rustflags %{?build_rustflags} --cfg=io_uring_skip_arch_check
 
 # While our version corresponds to an upstream tag, we still need to define
 # these macros in order to set the VERGEN_GIT_SHA and VERGEN_GIT_COMMIT_DATE
 # environment variables in multiple sections of the spec file.
-%global commit 3832971d04076c873370cc9a993b7b3178e3d2e3
-%global commitdatestring 2026-06-02 14:33:52 -0600
-%global cosmic_minver 1.0.15
+%global commit 9ec3133c1be67a0f7041d678ff062f775a22e933
+%global commitdatestring 2026-09-02 11:56:27 -0600
+%global cosmic_minver 1.8.0
 
 Name:           cosmic-monitor
-Version: 1.0.15
+Version: 1.8.0
 Release:        %autorelease
 Summary:        System monitor built with Libcosmic
 
