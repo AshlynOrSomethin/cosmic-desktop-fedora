@@ -1,7 +1,7 @@
 set dotenv-load
 
 NAME := env('NAME')
-TAG := '1.8.0'
+TAG := 'nightly'
 
 default:
     echo "default command does nothing"
