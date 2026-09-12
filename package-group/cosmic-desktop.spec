@@ -24,7 +24,6 @@ Requires:       cosmic-notifications
 Requires:       cosmic-monitor
 Requires:       cosmic-osd
 Requires:       cosmic-panel
-Requires:       cosmic-player
 Requires:       cosmic-randr
 Requires:       cosmic-screenshot
 Requires:       cosmic-session
