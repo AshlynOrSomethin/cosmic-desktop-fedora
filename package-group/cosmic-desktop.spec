@@ -13,7 +13,7 @@ Requires:       cosmic-app-library
 Requires:       cosmic-applets
 Requires:       cosmic-bg
 Requires:       cosmic-comp
-Requires:       cosmic-edit
+Suggests:       cosmic-edit
 Requires:       cosmic-files
 Requires:       cosmic-greeter
 Requires:       cosmic-icon-theme
@@ -21,7 +21,7 @@ Requires:       cosmic-idle
 Requires:       cosmic-initial-setup
 Requires:       cosmic-launcher
 Requires:       cosmic-notifications
-Requires:       cosmic-monitor
+Suggests:       cosmic-monitor
 Requires:       cosmic-osd
 Requires:       cosmic-panel
 Requires:       cosmic-randr
@@ -29,8 +29,8 @@ Requires:       cosmic-screenshot
 Requires:       cosmic-session
 Requires:       cosmic-settings
 Requires:       cosmic-settings-daemon
-Requires:       cosmic-store
-Requires:       cosmic-term
+Suggests:       cosmic-store
+Suggests:       cosmic-term
 Requires:       cosmic-wallpapers
 Requires:       cosmic-workspaces
 Requires:       pop-launcher
