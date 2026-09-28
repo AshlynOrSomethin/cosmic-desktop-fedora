@@ -1,0 +1,25 @@
+From e3f29033aa56078fc2a34310f96893e400c57db2 Mon Sep 17 00:00:00 2001
+From: Ryan Brue <ryanbrue.dev@gmail.com>
+Date: Mon, 28 Sep 2026 17:17:48 -0500
+Subject: [PATCH] Add cosmic-files-thumbnailer
+
+Signed-off-by: Ryan Brue <ryanbrue.dev@gmail.com>
+---
+ cosmic-files.spec | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/cosmic-files.spec b/cosmic-files.spec
+index 32a99fb..808ef5a 100644
+--- a/cosmic-files.spec
++++ b/cosmic-files.spec
+@@ -75,6 +75,7 @@ export VERGEN_GIT_COMMIT_DATE="date --utc '%{commitdatestring}'"
+ export VERGEN_GIT_SHA="%{commit}"
+ %cargo_build
+ %cargo_build -- --package cosmic-files-applet
++%cargo_build -- --package cosmic-files-thumbnailer
+ %{cargo_license_summary}
+ %{cargo_license} > LICENSE.dependencies
+ %{cargo_vendor_manifest}
+-- 
+2.55.0
+

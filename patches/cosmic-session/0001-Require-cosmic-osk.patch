@@ -1,0 +1,25 @@
+From 183b97445e7464cb37f62424e7e4c096155731f6 Mon Sep 17 00:00:00 2001
+From: Ryan Brue <ryanbrue.dev@gmail.com>
+Date: Mon, 28 Sep 2026 17:19:55 -0500
+Subject: [PATCH] Require cosmic-osk
+
+Signed-off-by: Ryan Brue <ryanbrue.dev@gmail.com>
+---
+ cosmic-session.spec | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/cosmic-session.spec b/cosmic-session.spec
+index 61b4164..86031c7 100644
+--- a/cosmic-session.spec
++++ b/cosmic-session.spec
+@@ -55,6 +55,7 @@ Requires:       cosmic-initial-setup >= %{cosmic_minver}
+ Requires:       cosmic-launcher >= %{cosmic_minver}
+ Requires:       cosmic-notifications >= %{cosmic_minver}
+ Requires:       cosmic-osd >= %{cosmic_minver}
++Requires:       cosmic-osk >= %{cosmic_minver}
+ Requires:       cosmic-panel >= %{cosmic_minver}
+ Requires:       cosmic-randr >= %{cosmic_minver}
+ Requires:       cosmic-screenshot >= %{cosmic_minver}
+-- 
+2.55.0
+
