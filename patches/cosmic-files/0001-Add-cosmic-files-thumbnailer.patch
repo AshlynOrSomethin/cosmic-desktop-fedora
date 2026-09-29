@@ -1,25 +1,39 @@
-From e3f29033aa56078fc2a34310f96893e400c57db2 Mon Sep 17 00:00:00 2001
+From 99314cdef6bb20fc4c068f6a9cd56d29d5bdbd5b Mon Sep 17 00:00:00 2001
 From: Ryan Brue <ryanbrue.dev@gmail.com>
 Date: Mon, 28 Sep 2026 17:17:48 -0500
 Subject: [PATCH] Add cosmic-files-thumbnailer
 
 Signed-off-by: Ryan Brue <ryanbrue.dev@gmail.com>
 ---
- cosmic-files.spec | 1 +
- 1 file changed, 1 insertion(+)
+ cosmic-files.spec | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
 
 diff --git a/cosmic-files.spec b/cosmic-files.spec
-index 32a99fb..808ef5a 100644
+index 32a99fb..b0b5df9 100644
 --- a/cosmic-files.spec
 +++ b/cosmic-files.spec
-@@ -75,6 +75,7 @@ export VERGEN_GIT_COMMIT_DATE="date --utc '%{commitdatestring}'"
+@@ -73,8 +73,7 @@ fi
+ # Set vergen environment variables
+ export VERGEN_GIT_COMMIT_DATE="date --utc '%{commitdatestring}'"
  export VERGEN_GIT_SHA="%{commit}"
- %cargo_build
- %cargo_build -- --package cosmic-files-applet
-+%cargo_build -- --package cosmic-files-thumbnailer
+-%cargo_build
+-%cargo_build -- --package cosmic-files-applet
++just rootdir=%{buildroot} prefix=%{_prefix} build-release
  %{cargo_license_summary}
  %{cargo_license} > LICENSE.dependencies
  %{cargo_vendor_manifest}
+@@ -103,9 +102,11 @@ export VERGEN_GIT_SHA="%{commit}"
+ %doc README.md
+ %{_bindir}/cosmic-files
+ %{_bindir}/cosmic-files-applet
++%{_bindir}/cosmic-files-thumbnailer
+ %{_datadir}/applications/com.system76.CosmicFiles.desktop
+ %{_metainfodir}/com.system76.CosmicFiles.metainfo.xml
+ %{_datadir}/icons/hicolor/*/apps/com.system76.CosmicFiles.svg
++${_datadir}/thumbnailers/com.system76.CosmicFiles.thumbnailer
+ 
+ %changelog
+ %autochangelog
 -- 
 2.55.0
 
