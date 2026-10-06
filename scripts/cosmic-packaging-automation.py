@@ -450,18 +450,31 @@ def determine_expected_version(
 def evaluate_koji_status(
     output: str,
     expected_version: str | None = None,
+    scoped_packages: dict[str, str] | None = None,
 ) -> str:
     """Evaluate the Koji status output and return one of:
-    - 'complete': All packages are COMPLETE with the expected version.
+    - 'complete': All (scoped) packages are COMPLETE with the expected version.
     - 'building': Some packages are still BUILDING with the expected version.
     - 'error': Some packages have unexpected status or wrong version.
 
     If ``expected_version`` is given, it is used as the target version;
     otherwise the most common version found in the status output is used.
+    ``scoped_packages`` limits evaluation to the given packages, so that
+    packages outside the current run (e.g. a --rpm_name run) cannot block
+    completion.
     """
     status = parse_koji_status(output)
     if not status:
         return "error"
+
+    if scoped_packages is not None:
+        status = {
+            name: branches
+            for name, branches in status.items()
+            if name in scoped_packages
+        }
+        if not status:
+            return "error"
 
     if not expected_version:
         expected_version = determine_expected_version(status)
@@ -1564,7 +1577,9 @@ def main() -> None:
             status
         )
 
-        result = evaluate_koji_status(status_output, expected_version)
+        result = evaluate_koji_status(
+            status_output, expected_version, scoped_packages
+        )
 
         if result == "complete":
             print()
