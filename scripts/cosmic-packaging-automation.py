@@ -802,20 +802,23 @@ def get_completed_build_nvrs(
     and at most one build per package (the one with the newest release number),
     since a Bodhi update can only reference a single build per package.
     """
-    client = __import__("koji").ClientSession(KOJI_HUB)
     # release name -> package name -> (release number, nvr) of newest build
     latest_builds: dict[str, dict[str, tuple[int, str]]] = {
         release: {} for release in FEDORA_RELEASES.values()
     }
 
-    for rpm_name in sorted(packages.keys()):
+    def fetch_package(rpm_name: str) -> dict[str, dict[str, tuple[int, str]]]:
+        client: Any = koji.ClientSession(KOJI_HUB)
         expected = (expected_versions or {}).get(rpm_name, "")
+        result: dict[str, dict[str, tuple[int, str]]] = {}
         for attempt in range(1, MAX_KOJI_QUERY_RETRIES + 1):
             try:
+                _koji_api_bucket.acquire()
                 package_id = client.getPackageID(rpm_name)
                 if not package_id:
                     break
 
+                _koji_api_bucket.acquire()
                 all_builds = client.listBuilds(
                     packageID=package_id,
                     queryOpts={"limit": 500},
@@ -825,8 +828,9 @@ def get_completed_build_nvrs(
                     task_id = build.get("task_id")
                     if not task_id:
                         continue
+                    _koji_api_bucket.acquire()
                     task = client.getTaskInfo(task_id)
-                    if task["state"] != __import__("koji").TASK_STATES["CLOSED"]:
+                    if task["state"] != koji.TASK_STATES["CLOSED"]:
                         continue
 
                     if expected and _version_compare(build["version"], expected) < 0:
@@ -844,7 +848,7 @@ def get_completed_build_nvrs(
                         release_str,
                     )
 
-                    per_package = latest_builds.setdefault(release_name, {})
+                    per_package = result.setdefault(release_name, {})
                     current = per_package.get(rpm_name)
                     if current is None or release_num > current[0]:
                         per_package[rpm_name] = (release_num, nvr)
@@ -867,6 +871,20 @@ def get_completed_build_nvrs(
                         f"after {attempt} attempts: {e}",
                         file=sys.stderr,
                     )
+        return result
+
+    max_workers = min(MAX_STATUS_WORKERS, max(1, len(packages)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[dict[str, dict[str, tuple[int, str]]]], str] = {
+            executor.submit(fetch_package, rpm_name): rpm_name
+            for rpm_name in sorted(packages.keys())
+        }
+        for future in as_completed(futures):
+            per_release = future.result()
+            for release_name, per_package in per_release.items():
+                target = latest_builds.setdefault(release_name, {})
+                for name, value in per_package.items():
+                    target[name] = value
 
     return {
         release: sorted(nvr for _, nvr in per_package.values())
