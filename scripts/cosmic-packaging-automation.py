@@ -266,7 +266,9 @@ def _status_color(status: str) -> str:
 
 
 def check_koji_status(
-    packages: dict[str, str], expected_version: str | None = None
+    packages: dict[str, str],
+    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
 ) -> None:
     """Use the Koji API to show per-Fedora-version build status for all cosmic packages.
 
@@ -274,8 +276,22 @@ def check_koji_status(
     using RPM release markers (e.g. fc44). Finds the newest version across all branches
     and shows the build/task status for that version (or the latest available) in each branch.
     If expected_version is provided, it is used as the reference "latest" version instead.
+    If expected_versions (per-package target versions) is provided, the reference version
+    is the most common one of those targets, so that a package at a slightly different
+    version (e.g. 1.9.1 while the rest are at 1.9.0) is still highlighted.
     """
     client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
+
+    # Reference version for highlighting builds that are not "latest":
+    # an explicit expected_version, else the most common per-package
+    # target, else each package's own newest build.
+    display_ref: str | None = None
+    if expected_version:
+        display_ref = expected_version
+    elif expected_versions:
+        targets = [v for v in expected_versions.values() if v]
+        if targets:
+            display_ref = Counter(targets).most_common(1)[0][0]
 
     print()
     print(f"{'Package':<35}", end="")
@@ -326,10 +342,7 @@ def check_koji_status(
 
             latest = _newest_build(all_branch_builds)
 
-            if expected_version:
-                ref_version = expected_version
-            else:
-                ref_version = latest["version"]
+            ref_version = display_ref if display_ref is not None else latest["version"]
 
             print(f"{rpm_name:<35}", end="")
 
@@ -1672,7 +1685,7 @@ def main() -> None:
         # displayed and parsed in the same pass.
         status_buffer = io.StringIO()
         with contextlib.redirect_stdout(status_buffer):
-            check_koji_status(PACKAGES, args.latest_version)
+            check_koji_status(PACKAGES, args.latest_version, tag_versions)
         status_output = status_buffer.getvalue()
         print(status_output)
 
