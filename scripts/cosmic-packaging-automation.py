@@ -1504,7 +1504,8 @@ def get_latest_tag_versions(packages: dict[str, str]) -> dict[str, str]:
     versions: dict[str, str] = {}
     if not packages:
         return versions
-    with ThreadPoolExecutor() as executor:
+    max_workers = min(MAX_BUILD_WORKERS, len(packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures: dict[Future[str], str] = {
             executor.submit(PackageBuilder.get_latest_tag, rpm_name): rpm_name
             for rpm_name in packages
@@ -1705,7 +1706,8 @@ def _run_builds(
     workdir: Path,
     tags: dict[str, str],
 ) -> None:
-    with ThreadPoolExecutor() as executor:
+    max_workers = min(MAX_BUILD_WORKERS, len(target_packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures: list[Future[None]] = []
         for pkg_name in target_packages:
             futures.append(
