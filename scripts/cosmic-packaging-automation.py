@@ -28,6 +28,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.error import HTTPError, URLError
@@ -437,6 +438,103 @@ def _status_color(status: str) -> str:
 # Koji status display
 # ---------------------------------------------------------------------------
 
+# One table cell per branch: (version_str, status, is_latest)
+_StatusCell = tuple[str, str, bool]
+
+
+@dataclass
+class _StatusRow:
+    """Result of the Koji queries for one package.
+
+    ``branches`` maps branch -> cell, or None for an N/A row; ``error``
+    holds the error message for an ERROR row.
+    """
+
+    branches: dict[str, _StatusCell | None] | None = None
+    error: str | None = None
+
+
+def _fetch_package_status_row(
+    rpm_name: str, display_ref: str | None
+) -> _StatusRow:
+    """Query Koji for one package, on its own (rate-limited) session."""
+    client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
+    try:
+        _koji_api_bucket.acquire()
+        package_id = client.getPackageID(rpm_name)
+        if not package_id:
+            return _StatusRow()
+
+        _koji_api_bucket.acquire()
+        all_builds = client.listBuilds(
+            packageID=package_id,
+            queryOpts={"limit": 500},
+        )
+        if not all_builds:
+            return _StatusRow()
+
+        branch_builds: dict[str, list[KojiBuild]] = {
+            branch: [] for branch in FEDORA_TAGS
+        }
+
+        for build in all_builds:
+            build_branch = _branch_for_release(build["release"])
+            if build_branch:
+                branch_builds[build_branch].append(build)
+
+        all_branch_builds = [b for builds in branch_builds.values() for b in builds]
+
+        if not all_branch_builds:
+            return _StatusRow()
+
+        latest = _newest_build(all_branch_builds)
+        ref_version = display_ref if display_ref is not None else latest["version"]
+
+        branches: dict[str, _StatusCell | None] = {}
+        for branch in FEDORA_TAGS:
+            builds = branch_builds[branch]
+            if not builds:
+                branches[branch] = None
+                continue
+            matching = [b for b in builds if _compare_builds(b, latest) == 0]
+            build = _newest_build(matching) if matching else _newest_build(builds)
+            release_clean = (
+                build["release"]
+                .replace(".fc46", "")
+                .replace(".fc45", "")
+                .replace(".fc44", "")
+                .replace(".fc43", "")
+            )
+            version_str = f"{build['version']}-{release_clean}"
+            _koji_api_bucket.acquire()
+            status = _get_task_status(client, build)
+            branches[branch] = (
+                version_str,
+                status,
+                _version_matches(build, ref_version),
+            )
+        return _StatusRow(branches=branches)
+    except Exception as e:
+        return _StatusRow(error=str(e))
+
+
+def _fetch_status_rows(
+    packages: dict[str, str], display_ref: str | None
+) -> dict[str, _StatusRow]:
+    """Fetch the status row of every package in parallel."""
+    rows: dict[str, _StatusRow] = {}
+    if not packages:
+        return rows
+    max_workers = min(MAX_STATUS_WORKERS, len(packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[_StatusRow], str] = {
+            executor.submit(_fetch_package_status_row, rpm_name, display_ref): rpm_name
+            for rpm_name in packages
+        }
+        for future in as_completed(futures):
+            rows[futures[future]] = future.result()
+    return rows
+
 
 def check_koji_status(
     packages: dict[str, str],
@@ -453,8 +551,6 @@ def check_koji_status(
     is the most common one of those targets, so that a package at a slightly different
     version (e.g. 1.9.1 while the rest are at 1.9.0) is still highlighted.
     """
-    client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
-
     # Reference version for highlighting builds that are not "latest":
     # an explicit expected_version, else the most common per-package
     # target, else each package's own newest build.
@@ -473,100 +569,50 @@ def check_koji_status(
     print()
     print("-" * (35 + 26 * len(FEDORA_TAGS)))
 
+    rows = _fetch_status_rows(packages, display_ref)
     for rpm_name in sorted(packages.keys()):
-        try:
-            package_id = client.getPackageID(rpm_name)
-            if not package_id:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
+        row = rows[rpm_name]
 
-            all_builds = client.listBuilds(
-                packageID=package_id,
-                queryOpts={"limit": 500},
-            )
-
-            if not all_builds:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
-
-            branch_builds: dict[str, list[KojiBuild]] = {
-                branch: [] for branch in FEDORA_TAGS
-            }
-
-            for build in all_builds:
-                build_branch = _branch_for_release(build["release"])
-                if build_branch:
-                    branch_builds[build_branch].append(build)
-
-            all_branch_builds = [b for builds in branch_builds.values() for b in builds]
-
-            if not all_branch_builds:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
-
-            latest = _newest_build(all_branch_builds)
-
-            ref_version = display_ref if display_ref is not None else latest["version"]
-
-            print(f"{rpm_name:<35}", end="")
-
-            for branch in FEDORA_TAGS:
-                builds = branch_builds[branch]
-
-                if not builds:
-                    print(f" {'N/A':<25}", end="")
-                    continue
-
-                matching = [b for b in builds if _compare_builds(b, latest) == 0]
-
-                if matching:
-                    build = _newest_build(matching)
-                else:
-                    build = _newest_build(builds)
-
-                release_clean = (
-                    build["release"]
-                    .replace(".fc46", "")
-                    .replace(".fc45", "")
-                    .replace(".fc44", "")
-                    .replace(".fc43", "")
-                )
-                version_str = f"{build['version']}-{release_clean}"
-                status = _get_task_status(client, build)
-                is_latest = _version_matches(build, ref_version)
-
-                version_color = ""
-                status_color = _status_color(status)
-                reset = "\033[0m"
-
-                if not is_latest:
-                    version_color = "\033[91m"  # red
-
-                if version_color or status_color:
-                    print(
-                        f" {version_color}{version_str}{reset} "
-                        f"({status_color}{status}{reset})",
-                        end="",
-                    )
-                else:
-                    print(f" {version_str} ({status})", end="")
-
-            print()
-        except Exception as e:
-            logger.error(f"Error checking {rpm_name}: {e}")
+        if row.error is not None:
+            logger.error(f"Error checking {rpm_name}: {row.error}")
             print(f"{rpm_name:<35}", end="")
             for _ in FEDORA_TAGS:
                 print(f" {'ERROR':<25}", end="")
             print()
+            continue
+
+        if row.branches is None:
+            print(f"{rpm_name:<35}", end="")
+            for _ in FEDORA_TAGS:
+                print(f" {'N/A':<25}", end="")
+            print()
+            continue
+
+        print(f"{rpm_name:<35}", end="")
+        for branch in FEDORA_TAGS:
+            cell = row.branches[branch]
+            if cell is None:
+                print(f" {'N/A':<25}", end="")
+                continue
+            version_str, status, is_latest = cell
+
+            version_color = ""
+            status_color = _status_color(status)
+            reset = "\033[0m"
+
+            if not is_latest:
+                version_color = "\033[91m"  # red
+
+            if version_color or status_color:
+                print(
+                    f" {version_color}{version_str}{reset} "
+                    f"({status_color}{status}{reset})",
+                    end="",
+                )
+            else:
+                print(f" {version_str} ({status})", end="")
+
+        print()
 
     print()
     print(f"Queried {len(packages)} packages via Koji ({KOJI_HUB})")
