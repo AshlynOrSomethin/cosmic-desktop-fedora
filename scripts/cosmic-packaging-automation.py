@@ -1163,7 +1163,8 @@ class PackageBuilder:
     def get_latest_tag(package: str) -> str:
         repo_name = PACKAGES[package]
         url = f"https://api.github.com/repos/pop-os/{repo_name}/tags"
-        with urlopen(url) as response:
+        request = Request(url, headers=_github_headers())
+        with _retry_urlopen(request, f"GitHub tags query for {package}") as response:
             data = json.load(response)
         # Tags are not guaranteed to be epoch-tagged (e.g. the newest tag
         # may be a plain version tag), so look for the first one that is
