@@ -31,7 +31,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen, urlretrieve
+from urllib.request import Request, urlopen
 
 # Koji build info is returned as a plain dict with mixed value types
 KojiBuild = dict[str, Any]
@@ -1177,13 +1177,31 @@ class PackageBuilder:
     @staticmethod
     def download_package(rpm_name: str, output_path: Path) -> str:
         url = f"https://copr.fedorainfracloud.org/api_3/package/?ownername=ryanabx&projectname=cosmic-epoch-tagged&packagename={rpm_name}&with_latest_succeeded_build=true"
-        with requests.get(url) as response:
-            data = response.json()
+
+        def fetch_api() -> dict[str, Any]:
+            _copr_api_bucket.acquire()
+            with requests.get(url, timeout=API_TIMEOUT_SECONDS) as response:
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise _TransientHTTPError(response.status_code, url)
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                return data
+
+        data = _retry_transient(fetch_api, f"Copr API query for {rpm_name}")
         source_package = data["builds"]["latest_succeeded"]["source_package"]["url"]
         version: str = data["builds"]["latest_succeeded"]["source_package"]["version"]
 
+        def download() -> None:
+            with requests.get(
+                source_package, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as response:
+                response.raise_for_status()
+                with open(output_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
         logger.debug(f"[{rpm_name}]: Downloading {source_package} to {output_path}...")
-        urlretrieve(source_package, output_path)
+        _retry_transient(download, f"src.rpm download for {rpm_name}")
         return version
 
     def clone_fedpkg_repo(self) -> None:
