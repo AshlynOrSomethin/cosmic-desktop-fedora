@@ -1313,48 +1313,60 @@ class PackageBuilder:
     def should_build(self, branch: str) -> bool:
         if self.force_build:
             return True
+        return self._branch_needs_build().get(branch, False)
+
+    def _branch_needs_build(self) -> dict[str, bool]:
+        """Map branch -> whether a build at self.version is still needed.
+
+        Runs a single ``koji list-builds`` (a GLOB over the NVR, without a
+        --state filter) that covers every branch at once, then splits the
+        result by branch and state locally: one query instead of two per
+        branch. Any error is treated as "nothing is BUILDING/COMPLETE",
+        so the affected branches are skipped for this cycle, like before.
+        """
         check = subprocess.run(
             [
                 "koji",
                 "list-builds",
                 f"--package={self.package}",
-                "--state=COMPLETE",
-                f"--pattern=*{self.version}-1.fc{PackageBuilder.branch_to_number(branch)}*",
-                "--quiet",
+                f"--pattern=*{self.version}-1.*",
             ],
             capture_output=True,
             text=True,
             check=False,
         )
-        check2: subprocess.CompletedProcess[str] = subprocess.run(
-            [
-                "koji",
-                "list-builds",
-                f"--package={self.package}",
-                "--state=BUILDING",
-                f"--pattern=*{self.version}-1.fc{PackageBuilder.branch_to_number(branch)}*",
-                "--quiet",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        currently_finished = (check.stdout or "").strip()
-        currently_building = (check2.stdout or "").strip()
-        if currently_finished != "":
-            logger.info(
-                f"[{self.package}, {branch}]: Found finished builds: {currently_finished.split('\n')}\n"
+        if check.returncode != 0 or (check.stderr or "").strip():
+            logger.warning(
+                f"[{self.package}]: koji list-builds failed: "
+                f"{(check.stderr or '').strip() or f'(exit code {check.returncode})'}; "
+                "skipping builds for this cycle"
             )
-        if currently_building != "":
+            return {br: False for br in FEDORA_BRANCHES}
+
+        finished: list[str] = []
+        building: list[str] = []
+        for line in (check.stdout or "").splitlines():
+            # Lines look like "nvr  owner  STATE"; the header and
+            # separator lines do not have three columns.
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            nvr, _owner, state = parts
+            if state == "COMPLETE":
+                finished.append(nvr)
+            elif state == "BUILDING":
+                building.append(nvr)
+        if finished:
+            logger.info(f"[{self.package}]: Found finished builds: {finished}\n")
+        if building:
             logger.info(
-                f"[{self.package}, {branch}]: Found currently building builds: {currently_building.split('\n')}\n"
+                f"[{self.package}]: Found currently building builds: {building}\n"
             )
-        return (
-            (check.stdout or "") == ""
-            and (check2.stdout or "") == ""
-            and (check.stderr or "") == ""
-            and (check2.stderr or "") == ""
-        )
+        needs_build: dict[str, bool] = {}
+        for br in FEDORA_BRANCHES:
+            marker = f"{self.version}-1.fc{PackageBuilder.branch_to_number(br)}"
+            needs_build[br] = not any(marker in nvr for nvr in (*finished, *building))
+        return needs_build
 
     @staticmethod
     def branch_to_number(branch: str) -> str:
@@ -1452,12 +1464,13 @@ class PackageBuilder:
 
     def build_with_side_tag(self, side_tag: str) -> bool:
         did_build_anything = False
+        needs_build = {} if self.force_build else self._branch_needs_build()
         for br in FEDORA_BRANCHES:
             if br == "all":
                 continue
             # Partial rebuild: skip branches where the expected version is
             # already COMPLETE or BUILDING in Koji
-            if not self.should_build(br):
+            if not self.force_build and not needs_build.get(br, False):
                 logger.info(
                     f"[{self.package}]: {br} skipped: {self.version} is already "
                     "COMPLETE or BUILDING in Koji"
