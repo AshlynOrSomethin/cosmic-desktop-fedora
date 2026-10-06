@@ -24,7 +24,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen, urlretrieve
@@ -224,6 +225,11 @@ def _compare_builds(a: KojiBuild, b: KojiBuild) -> int:
             (str(b.get("epoch") or 0), b["version"], b["release"]),
         )
     )
+
+
+def _version_compare(a: str, b: str) -> int:
+    """Compare two version strings using RPM version ordering."""
+    return int(rpm.labelCompare(("0", a, "0"), ("0", b, "0")))
 
 
 def _newest_build(builds: list[KojiBuild]) -> KojiBuild:
@@ -441,24 +447,56 @@ def determine_expected_version(
     if not versions:
         return None
 
-    from collections import Counter
-
     counter = Counter(versions)
     return counter.most_common(1)[0][0]
 
 
+def build_expected_versions(
+    tag_versions: dict[str, str],
+    packages: dict[str, str],
+    explicit_version: str | None,
+    status: dict[str, dict[str, tuple[str, str]]],
+) -> dict[str, str]:
+    """Compute the target version for each package.
+
+    Each package targets the version of its latest upstream tag. Packages
+    whose tag could not be determined fall back to, in order, the explicitly
+    given version, the most common version among the known tags, and the most
+    common version currently found in Koji. If none is available, the target
+    is "" and the version check for that package is disabled.
+    """
+    known_tags = [v for v in tag_versions.values() if v]
+    fallback = ""
+    if explicit_version:
+        fallback = explicit_version
+    elif known_tags:
+        fallback = Counter(known_tags).most_common(1)[0][0]
+    if not fallback:
+        fallback = determine_expected_version(status) or ""
+    return {
+        rpm_name: tag_versions.get(rpm_name, "") or fallback
+        for rpm_name in packages
+    }
+
+
 def evaluate_koji_status(
     output: str,
-    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
     scoped_packages: dict[str, str] | None = None,
 ) -> str:
     """Evaluate the Koji status output and return one of:
-    - 'complete': All (scoped) packages are COMPLETE with the expected version.
-    - 'building': Some packages are still BUILDING with the expected version.
-    - 'error': Some packages have unexpected status or wrong version.
+    - 'complete': All (scoped) packages are COMPLETE at their target version.
+    - 'building': Some packages are still BUILDING at the target version.
+    - 'error': Some packages have an unexpected status or an older version.
 
-    If ``expected_version`` is given, it is used as the target version;
-    otherwise the most common version found in the status output is used.
+    ``expected_versions`` maps package name -> target version: a branch is
+    satisfied when its build is BUILDING or COMPLETE at a version equal to
+    or newer than the target (RPM ordering). This allows individual packages
+    to be at a slightly different version than the rest (e.g. one package at
+    1.9.1 while the rest are at 1.9.0). A target of "" disables the version
+    check (status only). When ``expected_versions`` is None, a single expected
+    version is derived (the most common version in the output) and matched
+    exactly.
     ``scoped_packages`` limits evaluation to the given packages, so that
     packages outside the current run (e.g. a --rpm_name run) cannot block
     completion.
@@ -476,24 +514,35 @@ def evaluate_koji_status(
         if not status:
             return "error"
 
-    if not expected_version:
-        expected_version = determine_expected_version(status)
-    if not expected_version:
-        return "error"
-
     has_error = False
     has_building = False
 
-    for pkg_name, branches in status.items():
-        for branch, (version_str, task_status) in branches.items():
-            version = version_str.split("-")[0]
+    if expected_versions is not None:
+        for pkg_name, branches in status.items():
+            expected = expected_versions.get(pkg_name, "")
+            for branch, (version_str, task_status) in branches.items():
+                version = version_str.split("-")[0]
 
-            if task_status not in ("BUILDING", "COMPLETE"):
-                has_error = True
-            elif version != expected_version:
-                has_error = True
-            elif task_status == "BUILDING":
-                has_building = True
+                if task_status not in ("BUILDING", "COMPLETE"):
+                    has_error = True
+                elif expected and _version_compare(version, expected) < 0:
+                    has_error = True
+                elif task_status == "BUILDING":
+                    has_building = True
+    else:
+        expected_version = determine_expected_version(status)
+        if not expected_version:
+            return "error"
+        for branches in status.values():
+            for branch, (version_str, task_status) in branches.items():
+                version = version_str.split("-")[0]
+
+                if task_status not in ("BUILDING", "COMPLETE"):
+                    has_error = True
+                elif version != expected_version:
+                    has_error = True
+                elif task_status == "BUILDING":
+                    has_building = True
 
     if has_error:
         return "error"
@@ -510,15 +559,16 @@ def evaluate_koji_status(
 
 def get_completed_build_nvrs(
     packages: dict[str, str],
-    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Query Koji for completed build NVRs, grouped by Fedora release.
 
     Returns a dict mapping release name (e.g. 'F44') to a list of NVR strings
     like ['cosmic-term-0.1.0-1.fc44', 'cosmic-applets-0.1.0-1.fc44', ...].
-    Only includes builds whose task state is COMPLETE, and at most one
-    build per package (the one with the newest release number), since a
-    Bodhi update can only reference a single build per package.
+    Only includes builds whose task state is COMPLETE and whose version is
+    equal to or newer than the package's target version (``expected_versions``),
+    and at most one build per package (the one with the newest release number),
+    since a Bodhi update can only reference a single build per package.
     """
     client = __import__("koji").ClientSession(KOJI_HUB)
     # release name -> package name -> (release number, nvr) of newest build
@@ -527,6 +577,7 @@ def get_completed_build_nvrs(
     }
 
     for rpm_name in sorted(packages.keys()):
+        expected = (expected_versions or {}).get(rpm_name, "")
         for attempt in range(1, MAX_KOJI_QUERY_RETRIES + 1):
             try:
                 package_id = client.getPackageID(rpm_name)
@@ -546,7 +597,7 @@ def get_completed_build_nvrs(
                     if task["state"] != __import__("koji").TASK_STATES["CLOSED"]:
                         continue
 
-                    if expected_version and build["version"] != expected_version:
+                    if expected and _version_compare(build["version"], expected) < 0:
                         continue
 
                     release_str = build["release"]  # e.g. "2.fc45"
@@ -1153,6 +1204,33 @@ class PackageBuilder:
         return did_build_anything
 
 
+def get_latest_tag_versions(packages: dict[str, str]) -> dict[str, str]:
+    """Query upstream GitHub for the latest tag version of each package.
+
+    Returns a mapping of package name -> version string. Packages whose
+    latest tag could not be determined (API error, or no epoch-tagged tag)
+    map to an empty string.
+    """
+    versions: dict[str, str] = {}
+    if not packages:
+        return versions
+    with ThreadPoolExecutor() as executor:
+        futures: dict[Future[str], str] = {
+            executor.submit(PackageBuilder.get_latest_tag, rpm_name): rpm_name
+            for rpm_name in packages
+        }
+        for future in as_completed(futures):
+            rpm_name = futures[future]
+            try:
+                versions[rpm_name] = future.result()
+            except Exception as e:
+                logger.warning(
+                    f"[{rpm_name}]: Could not determine latest tag: {e}"
+                )
+                versions[rpm_name] = ""
+    return versions
+
+
 # ---------------------------------------------------------------------------
 # Single-package iteration
 # ---------------------------------------------------------------------------
@@ -1337,13 +1415,15 @@ def _run_builds(
 def _packages_needing_builds(
     status: dict[str, dict[str, tuple[str, str]]],
     packages: dict[str, str],
-    expected_version: str | None,
+    expected_versions: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Return the packages that still need (re)building.
 
     A package needs building unless every tracked branch already has a
-    BUILDING or COMPLETE build at the expected version. Packages missing
-    from ``status`` (e.g. never built) always need building.
+    BUILDING or COMPLETE build at a version equal to or newer than the
+    package's target version (``expected_versions``). A target of "" disables
+    the version check (status only). Packages missing from ``status``
+    (e.g. never built) always need building.
     """
     needed: dict[str, str] = {}
     for pkg_name, package in packages.items():
@@ -1351,8 +1431,9 @@ def _packages_needing_builds(
         if branches is None:
             needed[pkg_name] = package
             continue
+        expected = (expected_versions or {}).get(pkg_name, "")
         all_building_or_complete = all(
-            version_str.split("-")[0] == expected_version
+            (not expected or _version_compare(version_str.split("-")[0], expected) >= 0)
             and task_status in ("BUILDING", "COMPLETE")
             for version_str, task_status in branches.values()
         )
@@ -1460,7 +1541,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--latest-version",
-        help="Specify the expected latest version (defaults to highest version found in Koji)",
+        help="Specify the expected latest version (defaults to the latest upstream "
+        "tag of each package; used as a fallback for packages whose tag "
+        "cannot be determined)",
     )
 
     args = parser.parse_args()
@@ -1561,8 +1644,29 @@ def main() -> None:
     wait_seconds = args.koji_wait_time * 60
     max_koji_checks = 100
 
+    # Determine each package's target version (its latest upstream tag).
+    # Packages whose tag could not be determined (e.g. a transient GitHub
+    # API error) are re-queried on later loop iterations.
+    tag_versions: dict[str, str] = get_latest_tag_versions(PACKAGES)
+    for pkg_name, tag in sorted(tag_versions.items()):
+        if tag:
+            logger.info(f"[{pkg_name}]: Target version: {tag}")
+        else:
+            logger.warning(
+                f"[{pkg_name}]: Could not determine target version; "
+                "will retry on the next check"
+            )
+
     for check_num in range(1, max_koji_checks + 1):
         print(f"\n--- Koji status check #{check_num} ---")
+
+        missing_tags = {
+            name: repo
+            for name, repo in PACKAGES.items()
+            if not tag_versions.get(name)
+        }
+        if missing_tags:
+            tag_versions.update(get_latest_tag_versions(missing_tags))
 
         # Check Koji status once; capture the output so it can be
         # displayed and parsed in the same pass.
@@ -1573,12 +1677,12 @@ def main() -> None:
         print(status_output)
 
         status = parse_koji_status(status_output)
-        expected_version = args.latest_version or determine_expected_version(
-            status
+        expected_versions = build_expected_versions(
+            tag_versions, PACKAGES, args.latest_version, status
         )
 
         result = evaluate_koji_status(
-            status_output, expected_version, scoped_packages
+            status_output, expected_versions, scoped_packages
         )
 
         if result == "complete":
@@ -1593,7 +1697,9 @@ def main() -> None:
                 print("=" * 60)
                 print("Step 5: Creating Bodhi updates...")
                 print("=" * 60)
-                nvrs_by_release = get_completed_build_nvrs(PACKAGES, expected_version)
+                nvrs_by_release = get_completed_build_nvrs(
+                    PACKAGES, expected_versions
+                )
 
                 for release, nvrs in sorted(nvrs_by_release.items()):
                     if nvrs:
@@ -1614,12 +1720,12 @@ def main() -> None:
         # Queue builds for packages that are NOT in BUILDING or COMPLETE
         # at the target version
         packages_to_build = _packages_needing_builds(
-            status, scoped_packages, expected_version
+            status, scoped_packages, expected_versions
         )
         if packages_to_build:
             print(
                 f"Queuing builds for {len(packages_to_build)} package(s) not yet "
-                f"BUILDING/COMPLETE at {expected_version}:"
+                f"BUILDING/COMPLETE at their target version:"
             )
             for pkg_name in sorted(packages_to_build):
                 print(f"  - {pkg_name}")
@@ -1633,7 +1739,7 @@ def main() -> None:
         else:
             print(
                 "Nothing to queue: no scoped package is missing a BUILDING/COMPLETE "
-                "build at the target version."
+                "build at its target version."
             )
 
         if args.once:
