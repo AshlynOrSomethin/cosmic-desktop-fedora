@@ -195,6 +195,41 @@ def update_spec_license(
     return changed
 
 
+def validate_spdx_expression(license_str: str) -> bool:
+    """Validate a license expression using spdx-tools.
+
+    Returns True if the expression is valid. Returns False if the
+    expression is invalid, or if spdx-tools is not installed (in which
+    case validation cannot be performed at all).
+    """
+    print("  Validating license expression with spdx-tools...")
+    try:
+        from license_expression import ExpressionParseError
+        from spdx_tools.common.spdx_licensing import (
+            spdx_licensing,
+        )
+    except ImportError:
+        print(
+            "  WARNING: spdx-tools not installed, cannot validate license "
+            "expression, skipping. Install with: "
+            "pip install spdx-tools license-expression",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        spdx_licensing.parse(license_str, validate=True, strict=True)
+    except ExpressionParseError as spdx_err:
+        print(
+            f"  WARNING: SPDX expression is invalid:\n{spdx_err}",
+            file=sys.stderr,
+        )
+        return False
+
+    print("  SPDX expression is valid.")
+    return True
+
+
 def create_git_patch(
     repo_dir: pathlib.Path,
     patch_path: pathlib.Path,
@@ -323,33 +358,18 @@ def process_single_spec(
                 print(f"  [DRY RUN] License is already up to date.")
             return
 
+        # --- Step 4: Validate SPDX expression ---
+        # Validate before modifying the specfile so that an invalid
+        # expression (or missing validation tooling) does not leave the
+        # specfile with an unvalidated license.
+        if not validate_spdx_expression(new_license):
+            return
+
         changed = update_spec_license(spec_path, new_license)
 
         if not changed:
             print(f"  License is already up to date.")
             return
-
-        # --- Step 4: Validate SPDX expression ---
-        print("  Validating license expression with spdx-tools...")
-        try:
-            from license_expression import ExpressionParseError
-            from spdx_tools.common.spdx_licensing import (
-                spdx_licensing,
-            )
-
-            try:
-                spdx_licensing.parse(new_license, validate=True, strict=True)
-                print("  SPDX expression is valid.")
-            except ExpressionParseError as spdx_err:
-                print(
-                    f"  WARNING: SPDX expression is invalid:\n{spdx_err}",
-                    file=sys.stderr,
-                )
-        except ImportError:
-            print(
-                "  WARNING: spdx-tools not installed, skipping SPDX validation. Install with: pip install spdx-tools license-expression",
-                file=sys.stderr,
-            )
 
         # --- Step 5: Validate with rpmlint ---
         print("  Validating specfile with rpmlint...")
@@ -501,34 +521,17 @@ def main() -> None:
                     print(f"  [DRY RUN] License is already up to date.")
                 continue
 
+            # --- Step 3: Validate SPDX expression ---
+            # Validate before modifying the specfile so that an invalid
+            # expression (or missing validation tooling) cannot result
+            # in a patch being generated.
+            if not validate_spdx_expression(new_license):
+                continue
+
             changed = update_spec_license(spec_path, new_license)
 
             if not changed:
                 print(f"  License is already up to date.")
-                continue
-
-            # --- Step 3: Validate SPDX expression ---
-            print("  Validating license expression with spdx-tools...")
-            try:
-                from license_expression import ExpressionParseError
-                from spdx_tools.common.spdx_licensing import (
-                    spdx_licensing,
-                )
-
-                try:
-                    spdx_licensing.parse(new_license, validate=True, strict=True)
-                    print("  SPDX expression is valid.")
-                except ExpressionParseError as spdx_err:
-                    print(
-                        f"  WARNING: SPDX expression is invalid:\n{spdx_err}",
-                        file=sys.stderr,
-                    )
-                    continue
-            except ImportError:
-                print(
-                    "  WARNING: spdx-tools not installed, skipping SPDX validation. Install with: pip install spdx-tools license-expression",
-                    file=sys.stderr,
-                )
                 continue
 
             # --- Step 4: Validate with rpmlint ---
