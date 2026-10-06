@@ -243,23 +243,38 @@ def create_git_patch(
         ["git", "-C", str(repo_dir), "commit", "-m", "Update license"],
         check=True,
     )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_dir),
-            "format-patch",
-            "HEAD~1",
-            "-o",
-            str(patch_path.parent),
-        ],
-        check=True,
-    )
-    # The patch file is named like 0001-Update-license.patch
-    # Move/rename it to update-license.patch
-    patch_files = sorted(patch_path.parent.glob("0001-*.patch"))
-    if patch_files:
-        patch_files[0].rename(patch_path)
+    # Generate the patch in a scratch directory instead of the target
+    # directory. Writing into the target directory directly would leave
+    # the format-patch output sitting next to pre-existing patches
+    # (e.g. 0001-Fixes.patch), and a glob-based rename could then move
+    # the wrong file into place, clobbering existing patches.
+    with tempfile.TemporaryDirectory(prefix="cosmic-license-patch-") as tmpdir:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "format-patch",
+                "HEAD~1",
+                "-o",
+                tmpdir,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # git format-patch prints the path of each patch file it created
+        # to stdout. A single-commit range produces exactly one file.
+        generated_paths = [
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        ]
+        if not generated_paths:
+            raise RuntimeError("git format-patch did not report any patch files")
+        generated_patch = pathlib.Path(generated_paths[-1])
+        if not generated_patch.is_file():
+            raise RuntimeError(f"Patch file not found: {generated_patch}")
+        # Move only the file format-patch actually created into place.
+        shutil.move(str(generated_patch), str(patch_path))
 
 
 def parse_spec_file(spec_path: pathlib.Path) -> tuple[str | None, str | None]:
@@ -565,7 +580,7 @@ def main() -> None:
             print(f"  Creating patch at {patch_path}")
             try:
                 create_git_patch(fedora_dir, patch_path)
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, RuntimeError) as e:
                 print(f"  ERROR: Failed to create patch: {e}", file=sys.stderr)
                 continue
 
