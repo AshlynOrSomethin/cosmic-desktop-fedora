@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen, urlretrieve
@@ -860,7 +860,7 @@ def create_bodhi_updates(
 
 
 # ---------------------------------------------------------------------------
-# PackageBuilder (build logic from cosmic-packaging-new-release.py)
+# PackageBuilder
 # ---------------------------------------------------------------------------
 
 
@@ -1276,34 +1276,49 @@ def run_builds(
     side_tag: str,
     force_map: dict[str, bool] | None = None,
     dry_run: bool = False,
+    workdir: Path | None = None,
 ) -> None:
     """Queue builds for the given packages using the side tag.
 
     ``force_map`` lists packages that must be rebuilt even if a build with
-    the expected version is already BUILDING or COMPLETE.
+    the expected version is already BUILDING or COMPLETE. If ``workdir`` is
+    not given, a temporary directory is created and removed afterwards.
     """
     if not target_packages:
         logger.info("No packages need building.")
         return
     force_map = force_map or {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        workdir = Path(tmpdir)
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for pkg_name in target_packages:
-                futures.append(
-                    executor.submit(
-                        build_package,
-                        pkg_name,
-                        force_map.get(pkg_name, False),
-                        workdir,
-                        side_tag,
-                        dry_run,
-                    )
+    if workdir is None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _run_builds(target_packages, side_tag, force_map, dry_run, Path(tmpdir))
+    else:
+        workdir.mkdir(parents=True, exist_ok=True)
+        _run_builds(target_packages, side_tag, force_map, dry_run, workdir)
+
+
+def _run_builds(
+    target_packages: dict[str, str],
+    side_tag: str,
+    force_map: dict[str, bool],
+    dry_run: bool,
+    workdir: Path,
+) -> None:
+    with ThreadPoolExecutor() as executor:
+        futures: list[Future[None]] = []
+        for pkg_name in target_packages:
+            futures.append(
+                executor.submit(
+                    build_package,
+                    pkg_name,
+                    force_map.get(pkg_name, False),
+                    workdir,
+                    side_tag,
+                    dry_run,
                 )
-            for future in futures:
-                future.result()
+            )
+        for future in futures:
+            future.result()
 
 
 def _packages_needing_builds(
@@ -1383,13 +1398,23 @@ def main() -> None:
         help="Name of the RPM to build (defaults to all of them)",
         choices=list(PACKAGES.keys()),
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Queue builds once and exit, without waiting for them to complete",
+    )
+    parser.add_argument(
+        "--workdir",
+        type=Path,
+        help="Working directory for building (defaults to a temporary directory)",
+    )
 
     # Monitoring
     parser.add_argument(
         "--koji-wait-time",
         type=int,
         default=5,
-        help="Time in minutes to wait between Koji status checks (default: 10)",
+        help="Time in minutes to wait between Koji status checks (default: 5)",
     )
 
     # Bodhi
@@ -1583,12 +1608,23 @@ def main() -> None:
             )
             for pkg_name in sorted(packages_to_build):
                 print(f"  - {pkg_name}")
-            run_builds(packages_to_build, side_tag, force_map, args.dry_run)
+            run_builds(
+                packages_to_build,
+                side_tag,
+                force_map,
+                args.dry_run,
+                args.workdir,
+            )
         else:
             print(
                 "Nothing to queue: no scoped package is missing a BUILDING/COMPLETE "
                 "build at the target version."
             )
+
+        if args.once:
+            print()
+            print("Done queueing builds (--once). Not waiting for completion.")
+            sys.exit(0)
 
         print(f"Waiting {args.koji_wait_time} minutes before next check...")
         time.sleep(wait_seconds)

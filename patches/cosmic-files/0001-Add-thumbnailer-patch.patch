@@ -1,0 +1,27 @@
+From 47cf45f02b401c71d7dd395b82676282dc23d310 Mon Sep 17 00:00:00 2001
+From: Ryan Brue <ryanbrue.dev@gmail.com>
+Date: Tue, 6 Oct 2026 00:31:38 -0500
+Subject: [PATCH] Add thumbnailer patch
+
+Signed-off-by: Ryan Brue <ryanbrue.dev@gmail.com>
+---
+ cosmic-files.spec | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/cosmic-files.spec b/cosmic-files.spec
+index 43b6609..cf1d97b 100644
+--- a/cosmic-files.spec
++++ b/cosmic-files.spec
+@@ -93,7 +93,9 @@ export VERGEN_GIT_SHA="%{commit}"
+ %doc README.md
+ %{_bindir}/cosmic-files
+ %{_bindir}/cosmic-files-applet
++%{_bindir}/cosmic-files-thumbnailer
+ %{_datadir}/applications/com.system76.CosmicFiles.desktop
++%{_datadir}/thumbnailers/com.system76.CosmicFiles.thumbnailer
+ %{_metainfodir}/com.system76.CosmicFiles.metainfo.xml
+ %{_datadir}/icons/hicolor/*/apps/com.system76.CosmicFiles.svg
+ 
+-- 
+2.55.0
+

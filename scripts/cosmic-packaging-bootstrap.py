@@ -685,7 +685,7 @@ class SpecFile:
         for in_line in spec_in.splitlines():
             out_line = in_line
             if in_line.startswith("# Generated using the scripts"):
-                out_line = "# Generated using the scripts at # Generated using the scripts at https://forge.fedoraproject.org/cosmic/cosmic-packaging/src/branch/main/scripts"
+                out_line = "# Generated using the scripts at https://forge.fedoraproject.org/cosmic/cosmic-packaging/src/branch/main/scripts"
             elif (
                 in_line.startswith("%global commit ")
                 or in_line.startswith(
@@ -746,7 +746,7 @@ PACKAGE_INFO: dict[str, ProjectInfo] = {
     "cosmic-idle": ProjectInfo(rpm_name="cosmic-idle"),
     "cosmic-initial-setup": ProjectInfo(rpm_name="cosmic-initial-setup", zip_self=True),
     "cosmic-launcher": ProjectInfo(rpm_name="cosmic-launcher"),
-    "cosmic-monitor": ProjectInfo(rpm_name="cosmic-monitor", staging=True),
+    "cosmic-monitor": ProjectInfo(rpm_name="cosmic-monitor"),
     "cosmic-notifications": ProjectInfo(rpm_name="cosmic-notifications"),
     "cosmic-osd": ProjectInfo(rpm_name="cosmic-osd"),
     "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk", staging=True),

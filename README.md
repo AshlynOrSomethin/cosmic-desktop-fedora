@@ -33,9 +33,9 @@ sudo rpm-ostree override replace --experimental --from repo=copr:copr.fedorainfr
 - New tags are released on `https://github.com/pop-os/`, typically every Tuesday
 - A copr build (for https://copr.fedorainfracloud.org/coprs/ryanabx/cosmic-epoch-tagged) with the new tags is triggered by an automated action at `https://github.com/ryanabx/ryanabx-copr-automation/`.
     - If any packages fail to build on x86 or aarch64, the package maintainer (ryanabx) will go look through the errors and try to fix problems, and make patches as needed.
-- Once all packages build successfully, the package maintainer will trigger the `scripts/cosmic-packaging-new-release.py` script to download the src rpms from the tagged copr and import them into the official repos (`src.fedoraproject.org/rpms/cosmic-*`).
+- Once all packages build successfully, the package maintainer will run the `scripts/cosmic-packaging-automation.py` script to download the src rpms from the tagged copr and import them into the official repos (`src.fedoraproject.org/rpms/cosmic-*`).
 - Fedora Koji builds the COSMIC packages for upstream.
-- The package maintainer checks that all builds succeeded, and makes the update at `https://bodhi.fedoraproject.org`.
+- The automation script monitors the Koji builds until they complete, and can submit the Bodhi updates at `https://bodhi.fedoraproject.org` automatically.
 - Update gets enough karma, and gets released.
 
 ---
