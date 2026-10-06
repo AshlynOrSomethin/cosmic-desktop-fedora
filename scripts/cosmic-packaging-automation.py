@@ -1906,9 +1906,19 @@ def main() -> None:
         scoped_packages = PACKAGES
 
     # Drop packages that have no Fedora upstream repo: they cannot be
-    # built via fedpkg (e.g. cosmic-osk).
-    for pkg_name in list(scoped_packages):
-        if not _fedora_repo_exists(pkg_name):
+    # built via fedpkg (e.g. cosmic-osk). The checks run in parallel.
+    with ThreadPoolExecutor(
+        max_workers=min(8, max(1, len(scoped_packages)))
+    ) as executor:
+        repo_exists = {
+            name: future.result()
+            for name, future in (
+                (name, executor.submit(_fedora_repo_exists, name))
+                for name in scoped_packages
+            )
+        }
+    for pkg_name, exists in repo_exists.items():
+        if not exists:
             print(
                 f"WARNING: {pkg_name} has no Fedora upstream repo "
                 f"({FEDORA_SRC_REPO}/{pkg_name}); it cannot be built and "
