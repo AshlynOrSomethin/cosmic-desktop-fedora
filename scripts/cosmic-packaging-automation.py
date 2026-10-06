@@ -1410,7 +1410,7 @@ class PackageBuilder:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                for _ in range(5):
+                for i in range(5):
                     try:
                         subprocess.run(
                             ["fedpkg", "push"],
@@ -1424,6 +1424,8 @@ class PackageBuilder:
                         logger.warning(
                             f"[{self.package}, {branch}]: fedpkg push failed: {exc}"
                         )
+                        if i < 4:
+                            time.sleep(2**i)
         else:
             logger.info(
                 f"[{self.package}, {branch}]: Commit skipped. Commit messages matched."
