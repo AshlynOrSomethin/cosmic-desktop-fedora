@@ -17,7 +17,7 @@ Patch1: 0001-my-awesome-patch.patch
 ## Important scripts
 
 - `scripts/cosmic-packaging-bootstrap.py`: Used by the copr repositories to set up the SRPM sources, handling vendoring of rust dependencies and patch application.
-- `scripts/cosmic-packaging-new-release.py`: Used by the package maintainer to download src rpms from the tagged repo, and queue them for building in Koji.
+- `scripts/cosmic-packaging-automation.py`: Used by the package maintainer for new releases: sets up SSH/Kerberos authentication, requests a Koji side tag, downloads src rpms from the tagged copr repo, imports them into the Fedora src repos, queues Koji builds, monitors them to completion, and optionally creates Bodhi updates.
 
 ## Verify changes when modifying python scripts
 

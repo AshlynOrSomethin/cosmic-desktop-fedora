@@ -41,7 +41,7 @@ function build_package() {
     echo "Processing: $pkg"
     rm -f ~/workdir/$pkg.src.rpm
     rm -rf ~/workdir/$pkg/
-    python3 ./scripts/cosmic-packaging-new-release.py $pkg --side-tag $SIDE_TAG > ./.out/log-$item.txt
+    python3 ./scripts/cosmic-packaging-automation.py --rpm_name $pkg --side-tag $SIDE_TAG --skip-setup --once > ./.out/log-$item.txt
     rm -f ~/workdir/$pkg.src.rpm
     rm -rf ~/workdir/$pkg/
     echo "Done: $pkg"
