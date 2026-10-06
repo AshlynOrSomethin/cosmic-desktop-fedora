@@ -1,0 +1,68 @@
+From bd851f063c1c11b3c2eef561ae1cefdcf3bc9da0 Mon Sep 17 00:00:00 2001
+From: Ryan Brue <ryanbrue.dev@gmail.com>
+Date: Mon, 5 Oct 2026 23:50:53 -0500
+Subject: [PATCH] remove temp patch
+
+Signed-off-by: Ryan Brue <ryanbrue.dev@gmail.com>
+---
+ ...ystemd-service-conflicts-with-kmscon.patch | 33 -------------------
+ cosmic-greeter.spec                           |  3 --
+ 2 files changed, 36 deletions(-)
+ delete mode 100644 0001-feat-systemd-service-conflicts-with-kmscon.patch
+
+diff --git a/0001-feat-systemd-service-conflicts-with-kmscon.patch b/0001-feat-systemd-service-conflicts-with-kmscon.patch
+deleted file mode 100644
+index 552f5d6..0000000
+--- a/0001-feat-systemd-service-conflicts-with-kmscon.patch
++++ /dev/null
+@@ -1,33 +0,0 @@
+-From 3073850f0354665ddf359394c53a8d6fe7f6a473 Mon Sep 17 00:00:00 2001
+-From: Jocelyn Falempe <jfalempe@redhat.com>
+-Date: Thu, 17 Sep 2026 22:40:35 +0200
+-Subject: [PATCH] feat: systemd service, conflicts with kmscon
+-
+-kmscon is replacing agetty/fbcon on Fedora, and thus the systemd service
+-should conflict with kmsconvt@tty1 instead of agetty@tty1
+-
+-Otherwise both kmscon and cosmic greeter compete for the graphic cards.
+-
+-Signed-off-by: Jocelyn Falempe <jfalempe@redhat.com>
+----
+- debian/cosmic-greeter.service | 4 ++--
+- 1 file changed, 2 insertions(+), 2 deletions(-)
+-
+-diff --git a/debian/cosmic-greeter.service b/debian/cosmic-greeter.service
+-index 278e591..3abbb33 100644
+---- a/debian/cosmic-greeter.service
+-+++ b/debian/cosmic-greeter.service
+-@@ -1,8 +1,8 @@
+- [Unit]
+- Description=COSMIC Greeter
+- After=systemd-user-sessions.service plymouth-quit-wait.service cosmic-greeter-daemon.service
+--After=getty@tty1.service
+--Conflicts=getty@tty1.service
+-+After=getty@tty1.service ksmcon@tty1.service
+-+Conflicts=getty@tty1.service kmscon@tty1.service
+- Wants=cosmic-greeter-daemon.service
+- 
+- [Service]
+--- 
+-2.55.0
+-
+diff --git a/cosmic-greeter.spec b/cosmic-greeter.spec
+index 16306f5..c254af6 100644
+--- a/cosmic-greeter.spec
++++ b/cosmic-greeter.spec
+@@ -33,9 +33,6 @@ Source2:        vendor-config-%{version_no_tilde}.toml
+ Patch:          0001-Make-service-a-display-manager.patch
+ Patch:          include-greetd.patch
+ 
+-# Upstream fix for kmscon, from https://github.com/pop-os/cosmic-greeter/pull/546
+-Patch: 0001-feat-systemd-service-conflicts-with-kmscon.patch
+-
+ BuildRequires:  cargo-rpm-macros >= 25
+ BuildRequires:  rustc
+ BuildRequires:  lld
+-- 
+2.55.0
+
