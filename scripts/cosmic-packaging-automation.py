@@ -18,17 +18,20 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
-from urllib.request import urlopen, urlretrieve
+from typing import Any, Callable, TypeVar
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen, urlretrieve
 
 # Koji build info is returned as a plain dict with mixed value types
 KojiBuild = dict[str, Any]
@@ -97,6 +100,176 @@ MAX_KOJI_QUERY_RETRIES = 3
 KOJI_QUERY_RETRY_DELAY_SECONDS = 5
 MAX_BODHI_SAVE_ATTEMPTS = 5
 BODHI_SAVE_RETRY_DELAY_SECONDS = 10
+
+# Rate limits (sustained requests/sec, burst size) for the external APIs,
+# shared across all threads. Copr's front end refuses connections when hit
+# with many simultaneous requests, so its API is paced conservatively; the
+# src.rpm transfers and the git/fedpkg traffic are bounded by
+# MAX_BUILD_WORKERS instead.
+COPR_API_RATE_PER_SECOND = 1.0
+COPR_API_BURST = 3
+# GitHub's unauthenticated limit is 60 requests/hour, so stay gentle; with
+# a token (5000/hour) the paced rate is raised (see _github_rate below).
+GITHUB_API_RATE_PER_SECOND = 0.5
+GITHUB_API_BURST = 5
+GITHUB_API_RATE_PER_SECOND_WITH_TOKEN = 10.0
+GITHUB_API_BURST_WITH_TOKEN = 10
+# The old serial code already sustained ~10 calls/sec; the parallel status
+# checks are paced a bit above that so they win without bursting the Koji
+# proxy (at most MAX_STATUS_WORKERS concurrent connections).
+KOJI_API_RATE_PER_SECOND = 25.0
+KOJI_API_BURST = 32
+
+# Max number of packages handled in parallel by the thread pools.
+MAX_BUILD_WORKERS = 8
+MAX_STATUS_WORKERS = 8
+
+# Retries with exponential backoff for transient network failures
+# (connection refusals, timeouts, HTTP 429/5xx)
+MAX_TRANSIENT_RETRIES = 5
+TRANSIENT_RETRY_BASE_DELAY_SECONDS = 2.0
+TRANSIENT_RETRY_MAX_DELAY_SECONDS = 60.0
+
+# HTTP timeouts (seconds)
+API_TIMEOUT_SECONDS = 30
+DOWNLOAD_TIMEOUT_SECONDS = 600
+
+# ---------------------------------------------------------------------------
+# Rate limiting & transient-error retries
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class TokenBucket:
+    """Thread-safe token bucket shared across threads.
+
+    Tokens are added at a constant rate up to a burst capacity, and
+    callers block in ``acquire`` until they hold enough tokens. This
+    smooths bursts of parallel requests so that external APIs (Copr,
+    GitHub, Koji) are not overwhelmed by the thread pools.
+    """
+
+    def __init__(self, rate_per_second: float, burst: float) -> None:
+        self.rate = rate_per_second
+        self.burst = burst
+        self._tokens = burst
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0) -> None:
+        """Block until ``tokens`` are available, then consume them."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.burst, self._tokens + (now - self._updated) * self.rate
+                )
+                self._updated = now
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                wait = (tokens - self._tokens) / self.rate
+            time.sleep(wait)
+
+
+class _TransientHTTPError(Exception):
+    """An HTTP response (429/5xx) that is worth retrying after a delay."""
+
+    def __init__(self, status_code: int, url: str) -> None:
+        super().__init__(f"HTTP {status_code} from {url}")
+        self.status_code = status_code
+
+
+# Transient requests failures: connection refusals, timeouts, 429/5xx
+_TRANSIENT_REQUESTS_EXC: tuple[type[BaseException], ...] = (
+    requests.ConnectionError,
+    requests.Timeout,
+    _TransientHTTPError,
+)
+
+
+def _retry_transient(fn: Callable[[], T], what: str) -> T:
+    """Call ``fn``, retrying transient network failures with exponential
+    backoff and jitter."""
+    delay = TRANSIENT_RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        try:
+            return fn()
+        except _TRANSIENT_REQUESTS_EXC as e:
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            sleep_for = min(
+                TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
+            ) + random.uniform(0, 1.0)
+            logger.warning(
+                f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
+                f"{e}; retrying in {sleep_for:.1f}s"
+            )
+            time.sleep(sleep_for)
+            delay = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay * 2)
+    raise AssertionError("unreachable")
+
+
+def _retry_urlopen(request: Request, what: str) -> Any:
+    """urlopen with the same retry policy as ``_retry_transient``.
+
+    Connection-level failures and HTTP 5xx are retried; other HTTP errors
+    (e.g. the GitHub 403 rate-limit) are re-raised so that callers
+    (run_iteration) can apply their own longer wait. Returns the open
+    response, which the caller must close.
+    """
+    delay = TRANSIENT_RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        _github_api_bucket.acquire()
+        error: object = None
+        try:
+            return urlopen(request, timeout=API_TIMEOUT_SECONDS)
+        except HTTPError as e:
+            if e.code < 500 or attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            error = e
+        except (URLError, TimeoutError, ConnectionError) as e:
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            error = e
+        sleep_for = min(
+            TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
+        ) + random.uniform(0, 1.0)
+        logger.warning(
+            f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
+            f"{error}; retrying in {sleep_for:.1f}s"
+        )
+        time.sleep(sleep_for)
+        delay = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay * 2)
+    raise AssertionError("unreachable")
+
+
+def _github_headers() -> dict[str, str]:
+    """Headers for GitHub API requests.
+
+    Uses GITHUB_TOKEN/GH_TOKEN when available: the unauthenticated rate
+    limit (60 requests/hour) is tight for a full package run plus
+    retries, while a token raises it to 5000/hour.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_rate() -> tuple[float, float]:
+    """(rate, burst) for GitHub: faster when a token is available."""
+    if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+        return GITHUB_API_RATE_PER_SECOND_WITH_TOKEN, GITHUB_API_BURST_WITH_TOKEN
+    return GITHUB_API_RATE_PER_SECOND, GITHUB_API_BURST
+
+
+# Shared rate limiters for the external APIs (see constants above).
+_copr_api_bucket = TokenBucket(COPR_API_RATE_PER_SECOND, COPR_API_BURST)
+_github_api_bucket = TokenBucket(*_github_rate())
+_koji_api_bucket = TokenBucket(KOJI_API_RATE_PER_SECOND, KOJI_API_BURST)
 
 # ---------------------------------------------------------------------------
 # Shell helpers
