@@ -1180,13 +1180,21 @@ def create_bodhi_updates(
 
 class PackageBuilder:
     def __init__(
-        self, package: str, force_build: bool, dry_run: bool, working_directory: Path
+        self,
+        package: str,
+        force_build: bool,
+        dry_run: bool,
+        working_directory: Path,
+        tag: str = "",
     ) -> None:
         self.package = package
         self.force_build = force_build
         self.dry_run = dry_run
         self.working_directory = working_directory
-        self.tag = PackageBuilder.get_latest_tag(self.package)
+        # ``tag`` is normally passed in by the caller (the main loop has
+        # already queried GitHub for it), which avoids a duplicate API
+        # call; an empty tag means "query it now".
+        self.tag = tag if tag else PackageBuilder.get_latest_tag(self.package)
         logger.debug(f"[{self.package}]: Latest tag for package: {self.tag}")
         self.src_rpm = self.working_directory.joinpath(f"{self.package}.src.rpm")
         existing_rpms = glob.glob(
@@ -1565,6 +1573,7 @@ def run_iteration(
     side_tag: str,
     dry_run: bool,
     workdir: Path,
+    expected_tag: str = "",
 ) -> None:
     """Run one package's build, retrying after HTTP 403 rate limit errors.
 
@@ -1573,7 +1582,9 @@ def run_iteration(
     """
     for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
         try:
-            _run_iteration_once(rpm_name, force_build, side_tag, dry_run, workdir)
+            _run_iteration_once(
+                rpm_name, force_build, side_tag, dry_run, workdir, expected_tag
+            )
             return
         except Exception as e:
             if _is_rate_limit_error(e) and attempt < MAX_RATE_LIMIT_RETRIES:
@@ -1595,13 +1606,16 @@ def _run_iteration_once(
     side_tag: str,
     dry_run: bool,
     workdir: Path,
+    expected_tag: str = "",
 ) -> None:
     # Note: exceptions (e.g. rate limit errors) are intentionally
     # re-raised so that run_iteration can wait and retry the iteration.
     working_directory = workdir
     Path.mkdir(working_directory, exist_ok=True, parents=True)
     logger.debug(working_directory)
-    pkg = PackageBuilder(rpm_name, force_build, dry_run, working_directory)
+    pkg = PackageBuilder(
+        rpm_name, force_build, dry_run, working_directory, tag=expected_tag
+    )
 
     if pkg.tag == "":
         logger.error(
@@ -1633,12 +1647,19 @@ def _run_iteration_once(
 
 
 def build_package(
-    package: str, force_build: bool, workdir: Path, side_tag: str, dry_run: bool
+    package: str,
+    force_build: bool,
+    workdir: Path,
+    side_tag: str,
+    dry_run: bool,
+    expected_tag: str = "",
 ) -> None:
     working_directory = workdir.joinpath(package)
     try:
         logger.debug(f"[{package}]: Building package {package}")
-        run_iteration(package, force_build, side_tag, dry_run, working_directory)
+        run_iteration(
+            package, force_build, side_tag, dry_run, working_directory, expected_tag
+        )
         logger.debug(f"[{package}]: Done building package {package}")
     finally:
         shutil.rmtree(working_directory)
@@ -1650,24 +1671,30 @@ def run_builds(
     force_map: dict[str, bool] | None = None,
     dry_run: bool = False,
     workdir: Path | None = None,
+    tags: dict[str, str] | None = None,
 ) -> None:
     """Queue builds for the given packages using the side tag.
 
     ``force_map`` lists packages that must be rebuilt even if a build with
-    the expected version is already BUILDING or COMPLETE. If ``workdir`` is
+    the expected version is already BUILDING or COMPLETE. ``tags`` maps
+    package -> latest upstream tag, as already determined by the caller,
+    so the packages do not need to query GitHub again. If ``workdir`` is
     not given, a temporary directory is created and removed afterwards.
     """
     if not target_packages:
         logger.info("No packages need building.")
         return
     force_map = force_map or {}
+    tags = tags or {}
 
     if workdir is None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            _run_builds(target_packages, side_tag, force_map, dry_run, Path(tmpdir))
+            _run_builds(
+                target_packages, side_tag, force_map, dry_run, Path(tmpdir), tags
+            )
     else:
         workdir.mkdir(parents=True, exist_ok=True)
-        _run_builds(target_packages, side_tag, force_map, dry_run, workdir)
+        _run_builds(target_packages, side_tag, force_map, dry_run, workdir, tags)
 
 
 def _run_builds(
@@ -1676,6 +1703,7 @@ def _run_builds(
     force_map: dict[str, bool],
     dry_run: bool,
     workdir: Path,
+    tags: dict[str, str],
 ) -> None:
     with ThreadPoolExecutor() as executor:
         futures: list[Future[None]] = []
@@ -1688,6 +1716,7 @@ def _run_builds(
                     workdir,
                     side_tag,
                     dry_run,
+                    tags.get(pkg_name, ""),
                 )
             )
         for future in futures:
@@ -2017,6 +2046,7 @@ def main() -> None:
                 force_map,
                 args.dry_run,
                 args.workdir,
+                tags=tag_versions,
             )
         else:
             print(
