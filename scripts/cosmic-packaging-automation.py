@@ -1908,7 +1908,7 @@ def main() -> None:
         scoped_packages = PACKAGES
 
     # Drop packages that have no Fedora upstream repo: they cannot be
-    # built via fedpkg (e.g. cosmic-osk). The checks run in parallel.
+    # built via fedpkg. The checks run in parallel.
     with ThreadPoolExecutor(
         max_workers=min(8, max(1, len(scoped_packages)))
     ) as executor:

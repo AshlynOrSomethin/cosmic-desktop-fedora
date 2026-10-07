@@ -220,8 +220,19 @@ class TagInfo:
             # Return the name with epoch- removed and with `-` replaced with `~`
             return res.split("epoch-", 1)[1].replace("-", "~")
 
+    # Compute the version to use for %{cosmic_minver} from a tag: zero the
+    # patch component so that bugfix releases map back to the stable release
+    # (e.g. 1.9.1 -> 1.9.0), which is the latest version guaranteed to exist
+    # for all cosmic packages.
+    @staticmethod
+    def get_minver_tag(tag: str) -> str:
+        parts = tag.split(".")
+        if len(parts) >= 3 and parts[-1].isdigit():
+            parts[-1] = "0"
+        return ".".join(parts)
+
     def __init__(
-        self, directory_info: DirectoryInfo, tag: str | None, minver_tag: str | None
+        self, directory_info: DirectoryInfo, tag: str | None, minver_tag: str
     ) -> None:
         # Nightly specified if tag not specified
         self.nightly = tag is None
@@ -291,9 +302,20 @@ class TagInfo:
 
         info(f"tag: {self.tag}")
         info(f"tag_no_tilde: {self.tag_no_tilde}")
+        info(f"cosmic_minver: {self.minver}")
         info(f"commit: {self.commit}")
         info(f"commit_date: {self.commit_date}")
         info(f"commit_date_string: {self.commit_date_string}")
+
+    @property
+    def minver(self) -> str:
+        # Version for %{cosmic_minver}: the latest stable version. For tagged
+        # builds it is derived from the tag being built, for nightly builds
+        # from the package's latest tag. Bugfix releases are zeroed back to
+        # the stable base (1.9.1 -> 1.9.0) so that sibling packages which
+        # have no bugfix release still satisfy the requirement.
+        base = self.minver_tag if self.nightly else self.tag
+        return TagInfo.get_minver_tag(base)
 
 
 class ProjectOperations:
@@ -649,7 +671,7 @@ class SpecFile:
                 out_str += f"%global commitdatestring {tag_info.commit_date_string}\n"
                 out_str += f"%global commitdate {tag_info.commit_date}\n"
                 out_str += f"%global builddate {build_date}\n"
-                out_str += f"%global cosmic_minver {tag_info.minver_tag}\n\n"
+                out_str += f"%global cosmic_minver {tag_info.minver}\n\n"
                 skip = True
             elif in_line.startswith("Name: "):
                 skip = False
@@ -699,7 +721,7 @@ class SpecFile:
                 )
                 out_str += f"%global commit {tag_info.commit}\n"
                 out_str += f"%global commitdatestring {tag_info.commit_date_string}\n"
-                out_str += f"%global cosmic_minver {tag_info.tag}\n\n"
+                out_str += f"%global cosmic_minver {tag_info.minver}\n\n"
                 skip = True
             elif in_line.startswith("Name: "):
                 skip = False
@@ -749,7 +771,7 @@ PACKAGE_INFO: dict[str, ProjectInfo] = {
     "cosmic-monitor": ProjectInfo(rpm_name="cosmic-monitor"),
     "cosmic-notifications": ProjectInfo(rpm_name="cosmic-notifications"),
     "cosmic-osd": ProjectInfo(rpm_name="cosmic-osd"),
-    "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk", staging=True),
+    "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk"),
     "cosmic-panel": ProjectInfo(rpm_name="cosmic-panel"),
     "cosmic-player": ProjectInfo(rpm_name="cosmic-player"),
     "cosmic-randr": ProjectInfo(rpm_name="cosmic-randr"),
