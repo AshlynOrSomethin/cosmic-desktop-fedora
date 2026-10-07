@@ -18,16 +18,21 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.request import urlopen, urlretrieve
+from typing import Any, Callable, TypeVar
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 # Koji build info is returned as a plain dict with mixed value types
 KojiBuild = dict[str, Any]
@@ -96,6 +101,176 @@ MAX_KOJI_QUERY_RETRIES = 3
 KOJI_QUERY_RETRY_DELAY_SECONDS = 5
 MAX_BODHI_SAVE_ATTEMPTS = 5
 BODHI_SAVE_RETRY_DELAY_SECONDS = 10
+
+# Rate limits (sustained requests/sec, burst size) for the external APIs,
+# shared across all threads. Copr's front end refuses connections when hit
+# with many simultaneous requests, so its API is paced conservatively; the
+# src.rpm transfers and the git/fedpkg traffic are bounded by
+# MAX_BUILD_WORKERS instead.
+COPR_API_RATE_PER_SECOND = 1.0
+COPR_API_BURST = 3
+# GitHub's unauthenticated limit is 60 requests/hour, so stay gentle; with
+# a token (5000/hour) the paced rate is raised (see _github_rate below).
+GITHUB_API_RATE_PER_SECOND = 0.5
+GITHUB_API_BURST = 5
+GITHUB_API_RATE_PER_SECOND_WITH_TOKEN = 10.0
+GITHUB_API_BURST_WITH_TOKEN = 10
+# The old serial code already sustained ~10 calls/sec; the parallel status
+# checks are paced a bit above that so they win without bursting the Koji
+# proxy (at most MAX_STATUS_WORKERS concurrent connections).
+KOJI_API_RATE_PER_SECOND = 25.0
+KOJI_API_BURST = 32
+
+# Max number of packages handled in parallel by the thread pools.
+MAX_BUILD_WORKERS = 8
+MAX_STATUS_WORKERS = 8
+
+# Retries with exponential backoff for transient network failures
+# (connection refusals, timeouts, HTTP 429/5xx)
+MAX_TRANSIENT_RETRIES = 5
+TRANSIENT_RETRY_BASE_DELAY_SECONDS = 2.0
+TRANSIENT_RETRY_MAX_DELAY_SECONDS = 60.0
+
+# HTTP timeouts (seconds)
+API_TIMEOUT_SECONDS = 30
+DOWNLOAD_TIMEOUT_SECONDS = 600
+
+# ---------------------------------------------------------------------------
+# Rate limiting & transient-error retries
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class TokenBucket:
+    """Thread-safe token bucket shared across threads.
+
+    Tokens are added at a constant rate up to a burst capacity, and
+    callers block in ``acquire`` until they hold enough tokens. This
+    smooths bursts of parallel requests so that external APIs (Copr,
+    GitHub, Koji) are not overwhelmed by the thread pools.
+    """
+
+    def __init__(self, rate_per_second: float, burst: float) -> None:
+        self.rate = rate_per_second
+        self.burst = burst
+        self._tokens = burst
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0) -> None:
+        """Block until ``tokens`` are available, then consume them."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.burst, self._tokens + (now - self._updated) * self.rate
+                )
+                self._updated = now
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                wait = (tokens - self._tokens) / self.rate
+            time.sleep(wait)
+
+
+class _TransientHTTPError(Exception):
+    """An HTTP response (429/5xx) that is worth retrying after a delay."""
+
+    def __init__(self, status_code: int, url: str) -> None:
+        super().__init__(f"HTTP {status_code} from {url}")
+        self.status_code = status_code
+
+
+# Transient requests failures: connection refusals, timeouts, 429/5xx
+_TRANSIENT_REQUESTS_EXC: tuple[type[BaseException], ...] = (
+    requests.ConnectionError,
+    requests.Timeout,
+    _TransientHTTPError,
+)
+
+
+def _retry_transient(fn: Callable[[], T], what: str) -> T:
+    """Call ``fn``, retrying transient network failures with exponential
+    backoff and jitter."""
+    delay = TRANSIENT_RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        try:
+            return fn()
+        except _TRANSIENT_REQUESTS_EXC as e:
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            sleep_for = min(
+                TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
+            ) + random.uniform(0, 1.0)
+            logger.warning(
+                f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
+                f"{e}; retrying in {sleep_for:.1f}s"
+            )
+            time.sleep(sleep_for)
+            delay = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay * 2)
+    raise AssertionError("unreachable")
+
+
+def _retry_urlopen(request: Request, what: str) -> Any:
+    """urlopen with the same retry policy as ``_retry_transient``.
+
+    Connection-level failures and HTTP 5xx are retried; other HTTP errors
+    (e.g. the GitHub 403 rate-limit) are re-raised so that callers
+    (run_iteration) can apply their own longer wait. Returns the open
+    response, which the caller must close.
+    """
+    delay = TRANSIENT_RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        _github_api_bucket.acquire()
+        error: object = None
+        try:
+            return urlopen(request, timeout=API_TIMEOUT_SECONDS)
+        except HTTPError as e:
+            if e.code < 500 or attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            error = e
+        except (URLError, TimeoutError, ConnectionError) as e:
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            error = e
+        sleep_for = min(
+            TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
+        ) + random.uniform(0, 1.0)
+        logger.warning(
+            f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
+            f"{error}; retrying in {sleep_for:.1f}s"
+        )
+        time.sleep(sleep_for)
+        delay = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay * 2)
+    raise AssertionError("unreachable")
+
+
+def _github_headers() -> dict[str, str]:
+    """Headers for GitHub API requests.
+
+    Uses GITHUB_TOKEN/GH_TOKEN when available: the unauthenticated rate
+    limit (60 requests/hour) is tight for a full package run plus
+    retries, while a token raises it to 5000/hour.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_rate() -> tuple[float, float]:
+    """(rate, burst) for GitHub: faster when a token is available."""
+    if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+        return GITHUB_API_RATE_PER_SECOND_WITH_TOKEN, GITHUB_API_BURST_WITH_TOKEN
+    return GITHUB_API_RATE_PER_SECOND, GITHUB_API_BURST
+
+
+# Shared rate limiters for the external APIs (see constants above).
+_copr_api_bucket = TokenBucket(COPR_API_RATE_PER_SECOND, COPR_API_BURST)
+_github_api_bucket = TokenBucket(*_github_rate())
+_koji_api_bucket = TokenBucket(KOJI_API_RATE_PER_SECOND, KOJI_API_BURST)
 
 # ---------------------------------------------------------------------------
 # Shell helpers
@@ -226,6 +401,11 @@ def _compare_builds(a: KojiBuild, b: KojiBuild) -> int:
     )
 
 
+def _version_compare(a: str, b: str) -> int:
+    """Compare two version strings using RPM version ordering."""
+    return int(rpm.labelCompare(("0", a, "0"), ("0", b, "0")))
+
+
 def _newest_build(builds: list[KojiBuild]) -> KojiBuild:
     """Return the newest build from a list using RPM version ordering."""
     return max(builds, key=functools.cmp_to_key(_compare_builds))
@@ -258,9 +438,108 @@ def _status_color(status: str) -> str:
 # Koji status display
 # ---------------------------------------------------------------------------
 
+# One table cell per branch: (version_str, status, is_latest)
+_StatusCell = tuple[str, str, bool]
+
+
+@dataclass
+class _StatusRow:
+    """Result of the Koji queries for one package.
+
+    ``branches`` maps branch -> cell, or None for an N/A row; ``error``
+    holds the error message for an ERROR row.
+    """
+
+    branches: dict[str, _StatusCell | None] | None = None
+    error: str | None = None
+
+
+def _fetch_package_status_row(
+    rpm_name: str, display_ref: str | None
+) -> _StatusRow:
+    """Query Koji for one package, on its own (rate-limited) session."""
+    client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
+    try:
+        _koji_api_bucket.acquire()
+        package_id = client.getPackageID(rpm_name)
+        if not package_id:
+            return _StatusRow()
+
+        _koji_api_bucket.acquire()
+        all_builds = client.listBuilds(
+            packageID=package_id,
+            queryOpts={"limit": 500},
+        )
+        if not all_builds:
+            return _StatusRow()
+
+        branch_builds: dict[str, list[KojiBuild]] = {
+            branch: [] for branch in FEDORA_TAGS
+        }
+
+        for build in all_builds:
+            build_branch = _branch_for_release(build["release"])
+            if build_branch:
+                branch_builds[build_branch].append(build)
+
+        all_branch_builds = [b for builds in branch_builds.values() for b in builds]
+
+        if not all_branch_builds:
+            return _StatusRow()
+
+        latest = _newest_build(all_branch_builds)
+        ref_version = display_ref if display_ref is not None else latest["version"]
+
+        branches: dict[str, _StatusCell | None] = {}
+        for branch in FEDORA_TAGS:
+            builds = branch_builds[branch]
+            if not builds:
+                branches[branch] = None
+                continue
+            matching = [b for b in builds if _compare_builds(b, latest) == 0]
+            build = _newest_build(matching) if matching else _newest_build(builds)
+            release_clean = (
+                build["release"]
+                .replace(".fc46", "")
+                .replace(".fc45", "")
+                .replace(".fc44", "")
+                .replace(".fc43", "")
+            )
+            version_str = f"{build['version']}-{release_clean}"
+            _koji_api_bucket.acquire()
+            status = _get_task_status(client, build)
+            branches[branch] = (
+                version_str,
+                status,
+                _version_matches(build, ref_version),
+            )
+        return _StatusRow(branches=branches)
+    except Exception as e:
+        return _StatusRow(error=str(e))
+
+
+def _fetch_status_rows(
+    packages: dict[str, str], display_ref: str | None
+) -> dict[str, _StatusRow]:
+    """Fetch the status row of every package in parallel."""
+    rows: dict[str, _StatusRow] = {}
+    if not packages:
+        return rows
+    max_workers = min(MAX_STATUS_WORKERS, len(packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[_StatusRow], str] = {
+            executor.submit(_fetch_package_status_row, rpm_name, display_ref): rpm_name
+            for rpm_name in packages
+        }
+        for future in as_completed(futures):
+            rows[futures[future]] = future.result()
+    return rows
+
 
 def check_koji_status(
-    packages: dict[str, str], expected_version: str | None = None
+    packages: dict[str, str],
+    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
 ) -> None:
     """Use the Koji API to show per-Fedora-version build status for all cosmic packages.
 
@@ -268,8 +547,20 @@ def check_koji_status(
     using RPM release markers (e.g. fc44). Finds the newest version across all branches
     and shows the build/task status for that version (or the latest available) in each branch.
     If expected_version is provided, it is used as the reference "latest" version instead.
+    If expected_versions (per-package target versions) is provided, the reference version
+    is the most common one of those targets, so that a package at a slightly different
+    version (e.g. 1.9.1 while the rest are at 1.9.0) is still highlighted.
     """
-    client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
+    # Reference version for highlighting builds that are not "latest":
+    # an explicit expected_version, else the most common per-package
+    # target, else each package's own newest build.
+    display_ref: str | None = None
+    if expected_version:
+        display_ref = expected_version
+    elif expected_versions:
+        targets = [v for v in expected_versions.values() if v]
+        if targets:
+            display_ref = Counter(targets).most_common(1)[0][0]
 
     print()
     print(f"{'Package':<35}", end="")
@@ -278,103 +569,50 @@ def check_koji_status(
     print()
     print("-" * (35 + 26 * len(FEDORA_TAGS)))
 
+    rows = _fetch_status_rows(packages, display_ref)
     for rpm_name in sorted(packages.keys()):
-        try:
-            package_id = client.getPackageID(rpm_name)
-            if not package_id:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
+        row = rows[rpm_name]
 
-            all_builds = client.listBuilds(
-                packageID=package_id,
-                queryOpts={"limit": 500},
-            )
-
-            if not all_builds:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
-
-            branch_builds: dict[str, list[KojiBuild]] = {
-                branch: [] for branch in FEDORA_TAGS
-            }
-
-            for build in all_builds:
-                build_branch = _branch_for_release(build["release"])
-                if build_branch:
-                    branch_builds[build_branch].append(build)
-
-            all_branch_builds = [b for builds in branch_builds.values() for b in builds]
-
-            if not all_branch_builds:
-                print(f"{rpm_name:<35}", end="")
-                for _ in FEDORA_TAGS:
-                    print(f" {'N/A':<25}", end="")
-                print()
-                continue
-
-            latest = _newest_build(all_branch_builds)
-
-            if expected_version:
-                ref_version = expected_version
-            else:
-                ref_version = latest["version"]
-
-            print(f"{rpm_name:<35}", end="")
-
-            for branch in FEDORA_TAGS:
-                builds = branch_builds[branch]
-
-                if not builds:
-                    print(f" {'N/A':<25}", end="")
-                    continue
-
-                matching = [b for b in builds if _compare_builds(b, latest) == 0]
-
-                if matching:
-                    build = _newest_build(matching)
-                else:
-                    build = _newest_build(builds)
-
-                release_clean = (
-                    build["release"]
-                    .replace(".fc46", "")
-                    .replace(".fc45", "")
-                    .replace(".fc44", "")
-                    .replace(".fc43", "")
-                )
-                version_str = f"{build['version']}-{release_clean}"
-                status = _get_task_status(client, build)
-                is_latest = _version_matches(build, ref_version)
-
-                version_color = ""
-                status_color = _status_color(status)
-                reset = "\033[0m"
-
-                if not is_latest:
-                    version_color = "\033[91m"  # red
-
-                if version_color or status_color:
-                    print(
-                        f" {version_color}{version_str}{reset} "
-                        f"({status_color}{status}{reset})",
-                        end="",
-                    )
-                else:
-                    print(f" {version_str} ({status})", end="")
-
-            print()
-        except Exception as e:
-            logger.error(f"Error checking {rpm_name}: {e}")
+        if row.error is not None:
+            logger.error(f"Error checking {rpm_name}: {row.error}")
             print(f"{rpm_name:<35}", end="")
             for _ in FEDORA_TAGS:
                 print(f" {'ERROR':<25}", end="")
             print()
+            continue
+
+        if row.branches is None:
+            print(f"{rpm_name:<35}", end="")
+            for _ in FEDORA_TAGS:
+                print(f" {'N/A':<25}", end="")
+            print()
+            continue
+
+        print(f"{rpm_name:<35}", end="")
+        for branch in FEDORA_TAGS:
+            cell = row.branches[branch]
+            if cell is None:
+                print(f" {'N/A':<25}", end="")
+                continue
+            version_str, status, is_latest = cell
+
+            version_color = ""
+            status_color = _status_color(status)
+            reset = "\033[0m"
+
+            if not is_latest:
+                version_color = "\033[91m"  # red
+
+            if version_color or status_color:
+                print(
+                    f" {version_color}{version_str}{reset} "
+                    f"({status_color}{status}{reset})",
+                    end="",
+                )
+            else:
+                print(f" {version_str} ({status})", end="")
+
+        print()
 
     print()
     print(f"Queried {len(packages)} packages via Koji ({KOJI_HUB})")
@@ -441,46 +679,102 @@ def determine_expected_version(
     if not versions:
         return None
 
-    from collections import Counter
-
     counter = Counter(versions)
     return counter.most_common(1)[0][0]
 
 
+def build_expected_versions(
+    tag_versions: dict[str, str],
+    packages: dict[str, str],
+    explicit_version: str | None,
+    status: dict[str, dict[str, tuple[str, str]]],
+) -> dict[str, str]:
+    """Compute the target version for each package.
+
+    Each package targets the version of its latest upstream tag. Packages
+    whose tag could not be determined fall back to, in order, the explicitly
+    given version, the most common version among the known tags, and the most
+    common version currently found in Koji. If none is available, the target
+    is "" and the version check for that package is disabled.
+    """
+    known_tags = [v for v in tag_versions.values() if v]
+    fallback = ""
+    if explicit_version:
+        fallback = explicit_version
+    elif known_tags:
+        fallback = Counter(known_tags).most_common(1)[0][0]
+    if not fallback:
+        fallback = determine_expected_version(status) or ""
+    return {
+        rpm_name: tag_versions.get(rpm_name, "") or fallback
+        for rpm_name in packages
+    }
+
+
 def evaluate_koji_status(
     output: str,
-    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
+    scoped_packages: dict[str, str] | None = None,
 ) -> str:
     """Evaluate the Koji status output and return one of:
-    - 'complete': All packages are COMPLETE with the expected version.
-    - 'building': Some packages are still BUILDING with the expected version.
-    - 'error': Some packages have unexpected status or wrong version.
+    - 'complete': All (scoped) packages are COMPLETE at their target version.
+    - 'building': Some packages are still BUILDING at the target version.
+    - 'error': Some packages have an unexpected status or an older version.
 
-    If ``expected_version`` is given, it is used as the target version;
-    otherwise the most common version found in the status output is used.
+    ``expected_versions`` maps package name -> target version: a branch is
+    satisfied when its build is BUILDING or COMPLETE at a version equal to
+    or newer than the target (RPM ordering). This allows individual packages
+    to be at a slightly different version than the rest (e.g. one package at
+    1.9.1 while the rest are at 1.9.0). A target of "" disables the version
+    check (status only). When ``expected_versions`` is None, a single expected
+    version is derived (the most common version in the output) and matched
+    exactly.
+    ``scoped_packages`` limits evaluation to the given packages, so that
+    packages outside the current run (e.g. a --rpm_name run) cannot block
+    completion.
     """
     status = parse_koji_status(output)
     if not status:
         return "error"
 
-    if not expected_version:
-        expected_version = determine_expected_version(status)
-    if not expected_version:
-        return "error"
+    if scoped_packages is not None:
+        status = {
+            name: branches
+            for name, branches in status.items()
+            if name in scoped_packages
+        }
+        if not status:
+            return "error"
 
     has_error = False
     has_building = False
 
-    for pkg_name, branches in status.items():
-        for branch, (version_str, task_status) in branches.items():
-            version = version_str.split("-")[0]
+    if expected_versions is not None:
+        for pkg_name, branches in status.items():
+            expected = expected_versions.get(pkg_name, "")
+            for branch, (version_str, task_status) in branches.items():
+                version = version_str.split("-")[0]
 
-            if task_status not in ("BUILDING", "COMPLETE"):
-                has_error = True
-            elif version != expected_version:
-                has_error = True
-            elif task_status == "BUILDING":
-                has_building = True
+                if task_status not in ("BUILDING", "COMPLETE"):
+                    has_error = True
+                elif expected and _version_compare(version, expected) < 0:
+                    has_error = True
+                elif task_status == "BUILDING":
+                    has_building = True
+    else:
+        expected_version = determine_expected_version(status)
+        if not expected_version:
+            return "error"
+        for branches in status.values():
+            for branch, (version_str, task_status) in branches.items():
+                version = version_str.split("-")[0]
+
+                if task_status not in ("BUILDING", "COMPLETE"):
+                    has_error = True
+                elif version != expected_version:
+                    has_error = True
+                elif task_status == "BUILDING":
+                    has_building = True
 
     if has_error:
         return "error"
@@ -497,29 +791,34 @@ def evaluate_koji_status(
 
 def get_completed_build_nvrs(
     packages: dict[str, str],
-    expected_version: str | None = None,
+    expected_versions: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Query Koji for completed build NVRs, grouped by Fedora release.
 
     Returns a dict mapping release name (e.g. 'F44') to a list of NVR strings
     like ['cosmic-term-0.1.0-1.fc44', 'cosmic-applets-0.1.0-1.fc44', ...].
-    Only includes builds whose task state is COMPLETE, and at most one
-    build per package (the one with the newest release number), since a
-    Bodhi update can only reference a single build per package.
+    Only includes builds whose task state is COMPLETE and whose version is
+    equal to or newer than the package's target version (``expected_versions``),
+    and at most one build per package (the one with the newest release number),
+    since a Bodhi update can only reference a single build per package.
     """
-    client = __import__("koji").ClientSession(KOJI_HUB)
     # release name -> package name -> (release number, nvr) of newest build
     latest_builds: dict[str, dict[str, tuple[int, str]]] = {
         release: {} for release in FEDORA_RELEASES.values()
     }
 
-    for rpm_name in sorted(packages.keys()):
+    def fetch_package(rpm_name: str) -> dict[str, dict[str, tuple[int, str]]]:
+        client: Any = koji.ClientSession(KOJI_HUB)
+        expected = (expected_versions or {}).get(rpm_name, "")
+        result: dict[str, dict[str, tuple[int, str]]] = {}
         for attempt in range(1, MAX_KOJI_QUERY_RETRIES + 1):
             try:
+                _koji_api_bucket.acquire()
                 package_id = client.getPackageID(rpm_name)
                 if not package_id:
                     break
 
+                _koji_api_bucket.acquire()
                 all_builds = client.listBuilds(
                     packageID=package_id,
                     queryOpts={"limit": 500},
@@ -529,11 +828,12 @@ def get_completed_build_nvrs(
                     task_id = build.get("task_id")
                     if not task_id:
                         continue
+                    _koji_api_bucket.acquire()
                     task = client.getTaskInfo(task_id)
-                    if task["state"] != __import__("koji").TASK_STATES["CLOSED"]:
+                    if task["state"] != koji.TASK_STATES["CLOSED"]:
                         continue
 
-                    if expected_version and build["version"] != expected_version:
+                    if expected and _version_compare(build["version"], expected) < 0:
                         continue
 
                     release_str = build["release"]  # e.g. "2.fc45"
@@ -548,7 +848,7 @@ def get_completed_build_nvrs(
                         release_str,
                     )
 
-                    per_package = latest_builds.setdefault(release_name, {})
+                    per_package = result.setdefault(release_name, {})
                     current = per_package.get(rpm_name)
                     if current is None or release_num > current[0]:
                         per_package[rpm_name] = (release_num, nvr)
@@ -571,6 +871,20 @@ def get_completed_build_nvrs(
                         f"after {attempt} attempts: {e}",
                         file=sys.stderr,
                     )
+        return result
+
+    max_workers = min(MAX_STATUS_WORKERS, max(1, len(packages)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[dict[str, dict[str, tuple[int, str]]]], str] = {
+            executor.submit(fetch_package, rpm_name): rpm_name
+            for rpm_name in sorted(packages.keys())
+        }
+        for future in as_completed(futures):
+            per_release = future.result()
+            for release_name, per_package in per_release.items():
+                target = latest_builds.setdefault(release_name, {})
+                for name, value in per_package.items():
+                    target[name] = value
 
     return {
         release: sorted(nvr for _, nvr in per_package.values())
@@ -866,13 +1180,21 @@ def create_bodhi_updates(
 
 class PackageBuilder:
     def __init__(
-        self, package: str, force_build: bool, dry_run: bool, working_directory: Path
+        self,
+        package: str,
+        force_build: bool,
+        dry_run: bool,
+        working_directory: Path,
+        tag: str = "",
     ) -> None:
         self.package = package
         self.force_build = force_build
         self.dry_run = dry_run
         self.working_directory = working_directory
-        self.tag = PackageBuilder.get_latest_tag(self.package)
+        # ``tag`` is normally passed in by the caller (the main loop has
+        # already queried GitHub for it), which avoids a duplicate API
+        # call; an empty tag means "query it now".
+        self.tag = tag if tag else PackageBuilder.get_latest_tag(self.package)
         logger.debug(f"[{self.package}]: Latest tag for package: {self.tag}")
         self.src_rpm = self.working_directory.joinpath(f"{self.package}.src.rpm")
         existing_rpms = glob.glob(
@@ -913,7 +1235,8 @@ class PackageBuilder:
     def get_latest_tag(package: str) -> str:
         repo_name = PACKAGES[package]
         url = f"https://api.github.com/repos/pop-os/{repo_name}/tags"
-        with urlopen(url) as response:
+        request = Request(url, headers=_github_headers())
+        with _retry_urlopen(request, f"GitHub tags query for {package}") as response:
             data = json.load(response)
         # Tags are not guaranteed to be epoch-tagged (e.g. the newest tag
         # may be a plain version tag), so look for the first one that is
@@ -927,13 +1250,31 @@ class PackageBuilder:
     @staticmethod
     def download_package(rpm_name: str, output_path: Path) -> str:
         url = f"https://copr.fedorainfracloud.org/api_3/package/?ownername=ryanabx&projectname=cosmic-epoch-tagged&packagename={rpm_name}&with_latest_succeeded_build=true"
-        with requests.get(url) as response:
-            data = response.json()
+
+        def fetch_api() -> dict[str, Any]:
+            _copr_api_bucket.acquire()
+            with requests.get(url, timeout=API_TIMEOUT_SECONDS) as response:
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise _TransientHTTPError(response.status_code, url)
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                return data
+
+        data = _retry_transient(fetch_api, f"Copr API query for {rpm_name}")
         source_package = data["builds"]["latest_succeeded"]["source_package"]["url"]
         version: str = data["builds"]["latest_succeeded"]["source_package"]["version"]
 
+        def download() -> None:
+            with requests.get(
+                source_package, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as response:
+                response.raise_for_status()
+                with open(output_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
         logger.debug(f"[{rpm_name}]: Downloading {source_package} to {output_path}...")
-        urlretrieve(source_package, output_path)
+        _retry_transient(download, f"src.rpm download for {rpm_name}")
         return version
 
     def clone_fedpkg_repo(self) -> None:
@@ -980,48 +1321,60 @@ class PackageBuilder:
     def should_build(self, branch: str) -> bool:
         if self.force_build:
             return True
+        return self._branch_needs_build().get(branch, False)
+
+    def _branch_needs_build(self) -> dict[str, bool]:
+        """Map branch -> whether a build at self.version is still needed.
+
+        Runs a single ``koji list-builds`` (a GLOB over the NVR, without a
+        --state filter) that covers every branch at once, then splits the
+        result by branch and state locally: one query instead of two per
+        branch. Any error is treated as "nothing is BUILDING/COMPLETE",
+        so the affected branches are skipped for this cycle, like before.
+        """
         check = subprocess.run(
             [
                 "koji",
                 "list-builds",
                 f"--package={self.package}",
-                "--state=COMPLETE",
-                f"--pattern=*{self.version}-1.fc{PackageBuilder.branch_to_number(branch)}*",
-                "--quiet",
+                f"--pattern=*{self.version}-1.*",
             ],
             capture_output=True,
             text=True,
             check=False,
         )
-        check2: subprocess.CompletedProcess[str] = subprocess.run(
-            [
-                "koji",
-                "list-builds",
-                f"--package={self.package}",
-                "--state=BUILDING",
-                f"--pattern=*{self.version}-1.fc{PackageBuilder.branch_to_number(branch)}*",
-                "--quiet",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        currently_finished = (check.stdout or "").strip()
-        currently_building = (check2.stdout or "").strip()
-        if currently_finished != "":
-            logger.info(
-                f"[{self.package}, {branch}]: Found finished builds: {currently_finished.split('\n')}\n"
+        if check.returncode != 0 or (check.stderr or "").strip():
+            logger.warning(
+                f"[{self.package}]: koji list-builds failed: "
+                f"{(check.stderr or '').strip() or f'(exit code {check.returncode})'}; "
+                "skipping builds for this cycle"
             )
-        if currently_building != "":
+            return {br: False for br in FEDORA_BRANCHES}
+
+        finished: list[str] = []
+        building: list[str] = []
+        for line in (check.stdout or "").splitlines():
+            # Lines look like "nvr  owner  STATE"; the header and
+            # separator lines do not have three columns.
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            nvr, _owner, state = parts
+            if state == "COMPLETE":
+                finished.append(nvr)
+            elif state == "BUILDING":
+                building.append(nvr)
+        if finished:
+            logger.info(f"[{self.package}]: Found finished builds: {finished}\n")
+        if building:
             logger.info(
-                f"[{self.package}, {branch}]: Found currently building builds: {currently_building.split('\n')}\n"
+                f"[{self.package}]: Found currently building builds: {building}\n"
             )
-        return (
-            (check.stdout or "") == ""
-            and (check2.stdout or "") == ""
-            and (check.stderr or "") == ""
-            and (check2.stderr or "") == ""
-        )
+        needs_build: dict[str, bool] = {}
+        for br in FEDORA_BRANCHES:
+            marker = f"{self.version}-1.fc{PackageBuilder.branch_to_number(br)}"
+            needs_build[br] = not any(marker in nvr for nvr in (*finished, *building))
+        return needs_build
 
     @staticmethod
     def branch_to_number(branch: str) -> str:
@@ -1057,7 +1410,7 @@ class PackageBuilder:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                for _ in range(5):
+                for i in range(5):
                     try:
                         subprocess.run(
                             ["fedpkg", "push"],
@@ -1071,6 +1424,8 @@ class PackageBuilder:
                         logger.warning(
                             f"[{self.package}, {branch}]: fedpkg push failed: {exc}"
                         )
+                        if i < 4:
+                            time.sleep(2**i)
         else:
             logger.info(
                 f"[{self.package}, {branch}]: Commit skipped. Commit messages matched."
@@ -1119,12 +1474,13 @@ class PackageBuilder:
 
     def build_with_side_tag(self, side_tag: str) -> bool:
         did_build_anything = False
+        needs_build = {} if self.force_build else self._branch_needs_build()
         for br in FEDORA_BRANCHES:
             if br == "all":
                 continue
             # Partial rebuild: skip branches where the expected version is
             # already COMPLETE or BUILDING in Koji
-            if not self.should_build(br):
+            if not self.force_build and not needs_build.get(br, False):
                 logger.info(
                     f"[{self.package}]: {br} skipped: {self.version} is already "
                     "COMPLETE or BUILDING in Koji"
@@ -1138,6 +1494,34 @@ class PackageBuilder:
                     raise
                 logger.error(f"[{self.package}, {br}]: Error({br}): {e}\n")
         return did_build_anything
+
+
+def get_latest_tag_versions(packages: dict[str, str]) -> dict[str, str]:
+    """Query upstream GitHub for the latest tag version of each package.
+
+    Returns a mapping of package name -> version string. Packages whose
+    latest tag could not be determined (API error, or no epoch-tagged tag)
+    map to an empty string.
+    """
+    versions: dict[str, str] = {}
+    if not packages:
+        return versions
+    max_workers = min(MAX_BUILD_WORKERS, len(packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[str], str] = {
+            executor.submit(PackageBuilder.get_latest_tag, rpm_name): rpm_name
+            for rpm_name in packages
+        }
+        for future in as_completed(futures):
+            rpm_name = futures[future]
+            try:
+                versions[rpm_name] = future.result()
+            except Exception as e:
+                logger.warning(
+                    f"[{rpm_name}]: Could not determine latest tag: {e}"
+                )
+                versions[rpm_name] = ""
+    return versions
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1576,7 @@ def run_iteration(
     side_tag: str,
     dry_run: bool,
     workdir: Path,
+    expected_tag: str = "",
 ) -> None:
     """Run one package's build, retrying after HTTP 403 rate limit errors.
 
@@ -1200,7 +1585,9 @@ def run_iteration(
     """
     for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
         try:
-            _run_iteration_once(rpm_name, force_build, side_tag, dry_run, workdir)
+            _run_iteration_once(
+                rpm_name, force_build, side_tag, dry_run, workdir, expected_tag
+            )
             return
         except Exception as e:
             if _is_rate_limit_error(e) and attempt < MAX_RATE_LIMIT_RETRIES:
@@ -1222,13 +1609,16 @@ def _run_iteration_once(
     side_tag: str,
     dry_run: bool,
     workdir: Path,
+    expected_tag: str = "",
 ) -> None:
     # Note: exceptions (e.g. rate limit errors) are intentionally
     # re-raised so that run_iteration can wait and retry the iteration.
     working_directory = workdir
     Path.mkdir(working_directory, exist_ok=True, parents=True)
     logger.debug(working_directory)
-    pkg = PackageBuilder(rpm_name, force_build, dry_run, working_directory)
+    pkg = PackageBuilder(
+        rpm_name, force_build, dry_run, working_directory, tag=expected_tag
+    )
 
     if pkg.tag == "":
         logger.error(
@@ -1260,12 +1650,19 @@ def _run_iteration_once(
 
 
 def build_package(
-    package: str, force_build: bool, workdir: Path, side_tag: str, dry_run: bool
+    package: str,
+    force_build: bool,
+    workdir: Path,
+    side_tag: str,
+    dry_run: bool,
+    expected_tag: str = "",
 ) -> None:
     working_directory = workdir.joinpath(package)
     try:
         logger.debug(f"[{package}]: Building package {package}")
-        run_iteration(package, force_build, side_tag, dry_run, working_directory)
+        run_iteration(
+            package, force_build, side_tag, dry_run, working_directory, expected_tag
+        )
         logger.debug(f"[{package}]: Done building package {package}")
     finally:
         shutil.rmtree(working_directory)
@@ -1277,24 +1674,30 @@ def run_builds(
     force_map: dict[str, bool] | None = None,
     dry_run: bool = False,
     workdir: Path | None = None,
+    tags: dict[str, str] | None = None,
 ) -> None:
     """Queue builds for the given packages using the side tag.
 
     ``force_map`` lists packages that must be rebuilt even if a build with
-    the expected version is already BUILDING or COMPLETE. If ``workdir`` is
+    the expected version is already BUILDING or COMPLETE. ``tags`` maps
+    package -> latest upstream tag, as already determined by the caller,
+    so the packages do not need to query GitHub again. If ``workdir`` is
     not given, a temporary directory is created and removed afterwards.
     """
     if not target_packages:
         logger.info("No packages need building.")
         return
     force_map = force_map or {}
+    tags = tags or {}
 
     if workdir is None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            _run_builds(target_packages, side_tag, force_map, dry_run, Path(tmpdir))
+            _run_builds(
+                target_packages, side_tag, force_map, dry_run, Path(tmpdir), tags
+            )
     else:
         workdir.mkdir(parents=True, exist_ok=True)
-        _run_builds(target_packages, side_tag, force_map, dry_run, workdir)
+        _run_builds(target_packages, side_tag, force_map, dry_run, workdir, tags)
 
 
 def _run_builds(
@@ -1303,8 +1706,10 @@ def _run_builds(
     force_map: dict[str, bool],
     dry_run: bool,
     workdir: Path,
+    tags: dict[str, str],
 ) -> None:
-    with ThreadPoolExecutor() as executor:
+    max_workers = min(MAX_BUILD_WORKERS, len(target_packages))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures: list[Future[None]] = []
         for pkg_name in target_packages:
             futures.append(
@@ -1315,6 +1720,7 @@ def _run_builds(
                     workdir,
                     side_tag,
                     dry_run,
+                    tags.get(pkg_name, ""),
                 )
             )
         for future in futures:
@@ -1324,13 +1730,15 @@ def _run_builds(
 def _packages_needing_builds(
     status: dict[str, dict[str, tuple[str, str]]],
     packages: dict[str, str],
-    expected_version: str | None,
+    expected_versions: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Return the packages that still need (re)building.
 
     A package needs building unless every tracked branch already has a
-    BUILDING or COMPLETE build at the expected version. Packages missing
-    from ``status`` (e.g. never built) always need building.
+    BUILDING or COMPLETE build at a version equal to or newer than the
+    package's target version (``expected_versions``). A target of "" disables
+    the version check (status only). Packages missing from ``status``
+    (e.g. never built) always need building.
     """
     needed: dict[str, str] = {}
     for pkg_name, package in packages.items():
@@ -1338,8 +1746,9 @@ def _packages_needing_builds(
         if branches is None:
             needed[pkg_name] = package
             continue
+        expected = (expected_versions or {}).get(pkg_name, "")
         all_building_or_complete = all(
-            version_str.split("-")[0] == expected_version
+            (not expected or _version_compare(version_str.split("-")[0], expected) >= 0)
             and task_status in ("BUILDING", "COMPLETE")
             for version_str, task_status in branches.values()
         )
@@ -1447,7 +1856,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--latest-version",
-        help="Specify the expected latest version (defaults to highest version found in Koji)",
+        help="Specify the expected latest version (defaults to the latest upstream "
+        "tag of each package; used as a fallback for packages whose tag "
+        "cannot be determined)",
     )
 
     args = parser.parse_args()
@@ -1497,9 +1908,19 @@ def main() -> None:
         scoped_packages = PACKAGES
 
     # Drop packages that have no Fedora upstream repo: they cannot be
-    # built via fedpkg (e.g. cosmic-osk).
-    for pkg_name in list(scoped_packages):
-        if not _fedora_repo_exists(pkg_name):
+    # built via fedpkg (e.g. cosmic-osk). The checks run in parallel.
+    with ThreadPoolExecutor(
+        max_workers=min(8, max(1, len(scoped_packages)))
+    ) as executor:
+        repo_exists = {
+            name: future.result()
+            for name, future in (
+                (name, executor.submit(_fedora_repo_exists, name))
+                for name in scoped_packages
+            )
+        }
+    for pkg_name, exists in repo_exists.items():
+        if not exists:
             print(
                 f"WARNING: {pkg_name} has no Fedora upstream repo "
                 f"({FEDORA_SRC_REPO}/{pkg_name}); it cannot be built and "
@@ -1548,23 +1969,46 @@ def main() -> None:
     wait_seconds = args.koji_wait_time * 60
     max_koji_checks = 100
 
+    # Determine each package's target version (its latest upstream tag).
+    # Packages whose tag could not be determined (e.g. a transient GitHub
+    # API error) are re-queried on later loop iterations.
+    tag_versions: dict[str, str] = get_latest_tag_versions(PACKAGES)
+    for pkg_name, tag in sorted(tag_versions.items()):
+        if tag:
+            logger.info(f"[{pkg_name}]: Target version: {tag}")
+        else:
+            logger.warning(
+                f"[{pkg_name}]: Could not determine target version; "
+                "will retry on the next check"
+            )
+
     for check_num in range(1, max_koji_checks + 1):
         print(f"\n--- Koji status check #{check_num} ---")
+
+        missing_tags = {
+            name: repo
+            for name, repo in PACKAGES.items()
+            if not tag_versions.get(name)
+        }
+        if missing_tags:
+            tag_versions.update(get_latest_tag_versions(missing_tags))
 
         # Check Koji status once; capture the output so it can be
         # displayed and parsed in the same pass.
         status_buffer = io.StringIO()
         with contextlib.redirect_stdout(status_buffer):
-            check_koji_status(PACKAGES, args.latest_version)
+            check_koji_status(PACKAGES, args.latest_version, tag_versions)
         status_output = status_buffer.getvalue()
         print(status_output)
 
         status = parse_koji_status(status_output)
-        expected_version = args.latest_version or determine_expected_version(
-            status
+        expected_versions = build_expected_versions(
+            tag_versions, PACKAGES, args.latest_version, status
         )
 
-        result = evaluate_koji_status(status_output, expected_version)
+        result = evaluate_koji_status(
+            status_output, expected_versions, scoped_packages
+        )
 
         if result == "complete":
             print()
@@ -1578,7 +2022,9 @@ def main() -> None:
                 print("=" * 60)
                 print("Step 5: Creating Bodhi updates...")
                 print("=" * 60)
-                nvrs_by_release = get_completed_build_nvrs(PACKAGES, expected_version)
+                nvrs_by_release = get_completed_build_nvrs(
+                    PACKAGES, expected_versions
+                )
 
                 for release, nvrs in sorted(nvrs_by_release.items()):
                     if nvrs:
@@ -1599,12 +2045,12 @@ def main() -> None:
         # Queue builds for packages that are NOT in BUILDING or COMPLETE
         # at the target version
         packages_to_build = _packages_needing_builds(
-            status, scoped_packages, expected_version
+            status, scoped_packages, expected_versions
         )
         if packages_to_build:
             print(
                 f"Queuing builds for {len(packages_to_build)} package(s) not yet "
-                f"BUILDING/COMPLETE at {expected_version}:"
+                f"BUILDING/COMPLETE at their target version:"
             )
             for pkg_name in sorted(packages_to_build):
                 print(f"  - {pkg_name}")
@@ -1614,11 +2060,12 @@ def main() -> None:
                 force_map,
                 args.dry_run,
                 args.workdir,
+                tags=tag_versions,
             )
         else:
             print(
                 "Nothing to queue: no scoped package is missing a BUILDING/COMPLETE "
-                "build at the target version."
+                "build at its target version."
             )
 
         if args.once:
