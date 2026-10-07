@@ -749,7 +749,7 @@ PACKAGE_INFO: dict[str, ProjectInfo] = {
     "cosmic-monitor": ProjectInfo(rpm_name="cosmic-monitor"),
     "cosmic-notifications": ProjectInfo(rpm_name="cosmic-notifications"),
     "cosmic-osd": ProjectInfo(rpm_name="cosmic-osd"),
-    "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk", staging=True),
+    "cosmic-osk": ProjectInfo(rpm_name="cosmic-osk"),
     "cosmic-panel": ProjectInfo(rpm_name="cosmic-panel"),
     "cosmic-player": ProjectInfo(rpm_name="cosmic-player"),
     "cosmic-randr": ProjectInfo(rpm_name="cosmic-randr"),
