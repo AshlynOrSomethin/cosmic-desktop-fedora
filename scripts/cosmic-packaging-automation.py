@@ -1502,32 +1502,26 @@ class PackageBuilder:
         if needs_build:
             if not self.dry_run:
                 if side_tag and branch in SIDE_TAG_BRANCHES:
-                    try:
-                        subprocess.run(
-                            ["fedpkg", "build", f"--target={side_tag}"],
-                            cwd=self.repo_dir,
-                            timeout=10,
-                            capture_output=True,
-                            check=False,
-                        )
-                    except subprocess.TimeoutExpired:
-                        logger.info(
-                            f"[{self.package}, {branch}]: Building version {branch}\n"
-                        )
+                    subprocess.run(
+                        ["fedpkg", "build", f"--target={side_tag}", "--nowait"],
+                        cwd=self.repo_dir,
+                        capture_output=True,
+                        check=True,
+                    )
+                    logger.info(
+                        f"[{self.package}, {branch}]: Building version {branch}\n"
+                    )
                     return True
                 else:
-                    try:
-                        subprocess.run(
-                            ["fedpkg", "build"],
-                            cwd=self.repo_dir,
-                            timeout=10,
-                            capture_output=True,
-                            check=False,
-                        )
-                    except subprocess.TimeoutExpired:
-                        logger.info(
-                            f"[{self.package}, {branch}]: Building version {branch}\n"
-                        )
+                    subprocess.run(
+                        ["fedpkg", "build", "--nowait"],
+                        cwd=self.repo_dir,
+                        capture_output=True,
+                        check=True,
+                    )
+                    logger.info(
+                        f"[{self.package}, {branch}]: Building version {branch}\n"
+                    )
                     return True
             else:
                 logger.info(f"[{self.package}, {branch}]: Dry run - would build\n")
