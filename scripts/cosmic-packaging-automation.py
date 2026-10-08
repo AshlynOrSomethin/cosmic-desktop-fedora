@@ -1319,6 +1319,9 @@ class PackageBuilder:
         if branch == "rawhide":
             return 0 if rawhide_commit_msg.strip() != self.commit_msg else 1
         if rawhide_commit_msg.strip() != self.commit_msg:
+            logger.warning(
+                f"[{self.package}, {branch}]: Rawhide commit message doesn't match. Abort"
+            )
             return 2  # Cannot build branch without rawhide merging
         is_ancestor = (
             subprocess.run(
@@ -1359,6 +1362,9 @@ class PackageBuilder:
             == 0
         )
         if not can_merge:
+            logger.warning(
+                f"[{self.package}, {branch}]: Merge would cause conflicts. Abort"
+            )
             return 2  # We cannot merge, so we can't do the build
         return 0  # We need to commit if !is_ancestor and can_merge
 
@@ -1459,7 +1465,7 @@ class PackageBuilder:
                     )
                 else:  # Other branches will merge with rawhide
                     subprocess.run(
-                        ["git", "-C", self.repo_dir, "merge", "rawhide"],
+                        ["git", "-C", self.repo_dir, "merge", "--no-edit", "rawhide"],
                         cwd=self.repo_dir,
                         check=True,
                         stdout=subprocess.DEVNULL,
@@ -1496,32 +1502,26 @@ class PackageBuilder:
         if needs_build:
             if not self.dry_run:
                 if side_tag and branch in SIDE_TAG_BRANCHES:
-                    try:
-                        subprocess.run(
-                            ["fedpkg", "build", f"--target={side_tag}"],
-                            cwd=self.repo_dir,
-                            timeout=10,
-                            capture_output=True,
-                            check=False,
-                        )
-                    except subprocess.TimeoutExpired:
-                        logger.info(
-                            f"[{self.package}, {branch}]: Building version {branch}\n"
-                        )
+                    subprocess.run(
+                        ["fedpkg", "build", f"--target={side_tag}", "--nowait"],
+                        cwd=self.repo_dir,
+                        capture_output=True,
+                        check=True,
+                    )
+                    logger.info(
+                        f"[{self.package}, {branch}]: Building version {branch}\n"
+                    )
                     return True
                 else:
-                    try:
-                        subprocess.run(
-                            ["fedpkg", "build"],
-                            cwd=self.repo_dir,
-                            timeout=10,
-                            capture_output=True,
-                            check=False,
-                        )
-                    except subprocess.TimeoutExpired:
-                        logger.info(
-                            f"[{self.package}, {branch}]: Building version {branch}\n"
-                        )
+                    subprocess.run(
+                        ["fedpkg", "build", "--nowait"],
+                        cwd=self.repo_dir,
+                        capture_output=True,
+                        check=True,
+                    )
+                    logger.info(
+                        f"[{self.package}, {branch}]: Building version {branch}\n"
+                    )
                     return True
             else:
                 logger.info(f"[{self.package}, {branch}]: Dry run - would build\n")

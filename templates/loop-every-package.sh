@@ -1,4 +1,5 @@
 #!/bin/sh
+# Template to perform an action per package
 
 list=(
     "cosmic-app-library"
@@ -12,8 +13,10 @@ list=(
     "cosmic-idle"
     "cosmic-initial-setup"
     "cosmic-launcher"
+    "cosmic-monitor"
     "cosmic-notifications"
     "cosmic-osd"
+    "cosmic-osk"
     "cosmic-panel"
     "cosmic-player"
     "cosmic-randr"
@@ -29,30 +32,13 @@ list=(
     "xdg-desktop-portal-cosmic"
     )
 
-rm -rf ./.out
-mkdir -p ./.out
-
-# BEFORE RUNNING: MAKE SURE TO `fkinit`
-# fkinit -u ryanabx (For example)
-
-function build_package() {
+function perform_package_action() {
     pkg=$1
-    SIDE_TAG=f44-build-side-123334 # MODIFY THIS WITH NEW SIDE TAGS EACH CYCLE
-    echo "Processing: $pkg"
-    rm -f ~/workdir/$pkg.src.rpm
-    rm -rf ~/workdir/$pkg/
-    python3 ./scripts/cosmic-packaging-automation.py --rpm_name $pkg --side-tag $SIDE_TAG --skip-setup --once > ./.out/log-$item.txt
-    rm -f ~/workdir/$pkg.src.rpm
-    rm -rf ~/workdir/$pkg/
-    echo "Done: $pkg"
+    echo "$pkg"
+    # Perform desired action here
 }
-
-max_jobs=10
 
 for item in "${list[@]}"
 do
-    build_package $item &
-    (( $(jobs -r | wc -l) >= max_jobs )) && wait -n
+    perform_package_action $item
 done
-
-wait
