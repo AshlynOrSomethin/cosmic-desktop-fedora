@@ -200,9 +200,9 @@ def _retry_transient(fn: Callable[[], T], what: str) -> T:
         except _TRANSIENT_REQUESTS_EXC as e:
             if attempt >= MAX_TRANSIENT_RETRIES:
                 raise
-            sleep_for = min(
-                TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
-            ) + random.uniform(0, 1.0)
+            sleep_for = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay) + random.uniform(
+                0, 1.0
+            )
             logger.warning(
                 f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
                 f"{e}; retrying in {sleep_for:.1f}s"
@@ -234,9 +234,9 @@ def _retry_urlopen(request: Request, what: str) -> Any:
             if attempt >= MAX_TRANSIENT_RETRIES:
                 raise
             error = e
-        sleep_for = min(
-            TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay
-        ) + random.uniform(0, 1.0)
+        sleep_for = min(TRANSIENT_RETRY_MAX_DELAY_SECONDS, delay) + random.uniform(
+            0, 1.0
+        )
         logger.warning(
             f"{what}: transient error (attempt {attempt}/{MAX_TRANSIENT_RETRIES}): "
             f"{error}; retrying in {sleep_for:.1f}s"
@@ -454,9 +454,7 @@ class _StatusRow:
     error: str | None = None
 
 
-def _fetch_package_status_row(
-    rpm_name: str, display_ref: str | None
-) -> _StatusRow:
+def _fetch_package_status_row(rpm_name: str, display_ref: str | None) -> _StatusRow:
     """Query Koji for one package, on its own (rate-limited) session."""
     client: koji.ClientSession = koji.ClientSession(KOJI_HUB)
     try:
@@ -706,8 +704,7 @@ def build_expected_versions(
     if not fallback:
         fallback = determine_expected_version(status) or ""
     return {
-        rpm_name: tag_versions.get(rpm_name, "") or fallback
-        for rpm_name in packages
+        rpm_name: tag_versions.get(rpm_name, "") or fallback for rpm_name in packages
     }
 
 
@@ -1306,17 +1303,64 @@ class PackageBuilder:
                 i += 1
                 time.sleep(0.5)
 
-    def should_commit(self) -> bool:
-        if self.force_build:
-            return True
-        old_commit_msg = subprocess.run(
-            ["git", "-C", self.repo_dir, "log", "-1", "--pretty=%B"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,
-        ).stdout or ""
-        return old_commit_msg.strip() != self.commit_msg
+    def should_commit(self, branch: str) -> int:
+        if branch == "rawhide" and self.force_build:
+            return 0
+        rawhide_commit_msg = (
+            subprocess.run(
+                ["git", "-C", self.repo_dir, "log", "-1", "--format=%s", "rawhide"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            ).stdout
+            or ""
+        )
+        if branch == "rawhide":
+            return 0 if rawhide_commit_msg.strip() != self.commit_msg else 1
+        if rawhide_commit_msg.strip() != self.commit_msg:
+            return 2  # Cannot build branch without rawhide merging
+        is_ancestor = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    self.repo_dir,
+                    "merge-base",
+                    "--is-ancestor",
+                    "rawhide",
+                    branch,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if is_ancestor:
+            return 1  # Don't need to commit if branch is an ancestor of rawhide
+        can_merge = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    self.repo_dir,
+                    "merge-tree",
+                    "--write-tree",
+                    branch,
+                    "rawhide",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if not can_merge:
+            return 2  # We cannot merge, so we can't do the build
+        return 0  # We need to commit if !is_ancestor and can_merge
 
     def should_build(self, branch: str) -> bool:
         if self.force_build:
@@ -1394,22 +1438,33 @@ class PackageBuilder:
             stderr=subprocess.DEVNULL,
         )
         logger.debug(f"[{self.package}, {branch}]: Checking if should commit...")
-        if self.should_commit():
-            if not self.dry_run:
-                subprocess.run(
-                    ["fedpkg", "import", "--skip-diffs", self.src_rpm],
-                    cwd=self.repo_dir,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                subprocess.run(
-                    ["fedpkg", "commit", "-m", self.commit_msg],
-                    cwd=self.repo_dir,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+        match self.should_commit(branch):
+            case 0 if self.dry_run:
+                logger.info(f"[{self.package}, {branch}]: Dry run - would commit\n")
+            case 0 if not self.dry_run:
+                if branch == "rawhide":
+                    subprocess.run(
+                        ["fedpkg", "import", "--skip-diffs", self.src_rpm],
+                        cwd=self.repo_dir,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    subprocess.run(
+                        ["fedpkg", "commit", "-m", self.commit_msg],
+                        cwd=self.repo_dir,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:  # Other branches will merge with rawhide
+                    subprocess.run(
+                        ["git", "-C", self.repo_dir, "merge", "rawhide"],
+                        cwd=self.repo_dir,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 for i in range(5):
                     try:
                         subprocess.run(
@@ -1426,10 +1481,15 @@ class PackageBuilder:
                         )
                         if i < 4:
                             time.sleep(2**i)
-        else:
-            logger.info(
-                f"[{self.package}, {branch}]: Commit skipped. Commit messages matched."
-            )
+            case 1:  # No commit
+                logger.info(
+                    f"[{self.package}, {branch}]: Commit skipped. Commit messages matched."
+                )
+            case 2:  # Skip commit AND build
+                logger.warning(
+                    f"[{self.package}, {branch}]: Unable to commit. Most likely due to rawhide failures."
+                )
+                return False
         logger.debug(f"[{self.package}, {branch}]: Checking if should build...")
         if needs_build is None:
             needs_build = self.should_build(branch)
@@ -1517,9 +1577,7 @@ def get_latest_tag_versions(packages: dict[str, str]) -> dict[str, str]:
             try:
                 versions[rpm_name] = future.result()
             except Exception as e:
-                logger.warning(
-                    f"[{rpm_name}]: Could not determine latest tag: {e}"
-                )
+                logger.warning(f"[{rpm_name}]: Could not determine latest tag: {e}")
                 versions[rpm_name] = ""
     return versions
 
@@ -1986,9 +2044,7 @@ def main() -> None:
         print(f"\n--- Koji status check #{check_num} ---")
 
         missing_tags = {
-            name: repo
-            for name, repo in PACKAGES.items()
-            if not tag_versions.get(name)
+            name: repo for name, repo in PACKAGES.items() if not tag_versions.get(name)
         }
         if missing_tags:
             tag_versions.update(get_latest_tag_versions(missing_tags))
@@ -2006,9 +2062,7 @@ def main() -> None:
             tag_versions, PACKAGES, args.latest_version, status
         )
 
-        result = evaluate_koji_status(
-            status_output, expected_versions, scoped_packages
-        )
+        result = evaluate_koji_status(status_output, expected_versions, scoped_packages)
 
         if result == "complete":
             print()
@@ -2022,9 +2076,7 @@ def main() -> None:
                 print("=" * 60)
                 print("Step 5: Creating Bodhi updates...")
                 print("=" * 60)
-                nvrs_by_release = get_completed_build_nvrs(
-                    PACKAGES, expected_versions
-                )
+                nvrs_by_release = get_completed_build_nvrs(PACKAGES, expected_versions)
 
                 for release, nvrs in sorted(nvrs_by_release.items()):
                     if nvrs:
